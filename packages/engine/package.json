@@ -1,0 +1,34 @@
+{
+  "name": "@harnessorch/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "ho": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "ho": "tsx src/cli.ts",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "picocolors": "^1.1.1",
+    "yaml": "^2.9.1"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "assets"
+  ]
+}

@@ -1,0 +1,365 @@
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync, unlinkSync } from "node:fs";
+import { exec } from "../util/exec.js";
+import { log } from "../util/log.js";
+import { DEFAULT_DISPOSABLE_IGNORED } from "../config.js";
+
+export interface Worktree {
+  path: string;
+  branch: string;
+}
+
+export function slugify(s: string): string {
+  return (
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "task"
+  );
+}
+
+export function branchName(issue: number, slug: string): string {
+  return `task/${issue}-${slug}`;
+}
+
+export function worktreePath(root: string, issue: number, repoCwd: string): string {
+  return resolve(repoCwd, root, `issue-${issue}`);
+}
+
+interface RegisteredWorktree {
+  path: string;
+  branch: string | null;
+}
+
+export type WorktreeObservation =
+  | { outcome: "absent" }
+  | { outcome: "usable"; worktree: Worktree }
+  | { outcome: "conflict"; detail: string }
+  | { outcome: "error"; detail: string };
+
+class WorktreeReadError extends Error {}
+
+function pathIdentity(path: string): string {
+  const absolute = resolve(path);
+  const canonical = existsSync(absolute) ? realpathSync.native(absolute) : absolute;
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+function parseWorktrees(output: string): RegisteredWorktree[] {
+  const worktrees: RegisteredWorktree[] = [];
+  let current: RegisteredWorktree | undefined;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      current = { path: line.slice("worktree ".length), branch: null };
+      worktrees.push(current);
+    } else if (current && line.startsWith("branch ")) {
+      current.branch = line.slice("branch ".length);
+    }
+  }
+  return worktrees;
+}
+
+async function registeredWorktree(path: string, cwd: string): Promise<RegisteredWorktree> {
+  const result = await exec("git", ["worktree", "list", "--porcelain"], { cwd });
+  if (result.code !== 0) {
+    throw new WorktreeReadError(`worktree list failed: ${result.stderr.trim()}`);
+  }
+  const expected = pathIdentity(path);
+  const match = parseWorktrees(result.stdout).find((item) => pathIdentity(item.path) === expected);
+  if (!match) throw new Error(`worktree path is not registered by Git: ${path}`);
+  return match;
+}
+
+/**
+ * Observe whether the deterministic task path is a usable worktree without
+ * creating, attaching, or removing anything.
+ */
+export async function observeWorktree(
+  issue: number,
+  title: string,
+  root: string,
+  opts: { cwd?: string } = {},
+): Promise<WorktreeObservation> {
+  const cwd = opts.cwd ?? process.cwd();
+  const branch = branchName(issue, slugify(title));
+  const path = worktreePath(root, issue, cwd);
+  if (!existsSync(path)) return { outcome: "absent" };
+
+  let registered: RegisteredWorktree;
+  try {
+    registered = await registeredWorktree(path, cwd);
+  } catch (error) {
+    return {
+      outcome: error instanceof WorktreeReadError ? "error" : "conflict",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const expectedRef = `refs/heads/${branch}`;
+  if (registered.branch !== expectedRef) {
+    const actual = registered.branch?.replace(/^refs\/heads\//, "") ?? "detached HEAD";
+    return {
+      outcome: "conflict",
+      detail: `worktree path is attached to '${actual}', expected '${branch}': ${path}`,
+    };
+  }
+  return { outcome: "usable", worktree: { path, branch } };
+}
+
+/**
+ * Create (or re-attach) an isolated worktree + branch for an issue.
+ * Idempotent: if the worktree path already exists it is reused.
+ */
+export async function addWorktree(
+  issue: number,
+  title: string,
+  root: string,
+  opts: { baseRef: string; cwd?: string },
+): Promise<Worktree> {
+  const cwd = opts.cwd ?? process.cwd();
+  const branch = branchName(issue, slugify(title));
+  const path = worktreePath(root, issue, cwd);
+
+  if (existsSync(path)) {
+    const registered = await registeredWorktree(path, cwd);
+    const expectedRef = `refs/heads/${branch}`;
+    if (registered.branch !== expectedRef) {
+      const actual = registered.branch?.replace(/^refs\/heads\//, "") ?? "detached HEAD";
+      throw new Error(
+        `worktree path is attached to '${actual}', expected '${branch}': ${path}`,
+      );
+    }
+    return { path, branch };
+  }
+
+  // Try to create a fresh branch; fall back to attaching an existing branch.
+  const r = await exec("git", ["worktree", "add", "-b", branch, path, opts.baseRef], { cwd });
+  if (r.code !== 0) {
+    const r2 = await exec("git", ["worktree", "add", path, branch], { cwd });
+    if (r2.code !== 0) {
+      throw new Error(`worktree add failed: ${(r.stderr + "\n" + r2.stderr).trim()}`);
+    }
+  }
+  return { path, branch };
+}
+
+/**
+ * Pure: the entries of `git status --porcelain=v1 --untracked-files=all
+ * --ignored=matching` that make a worktree unsafe to remove — every dirty or
+ * untracked entry, plus ignored paths outside the `disposable` allowlist.
+ * Allowlist entries are worktree-relative; a trailing `/` covers a directory and
+ * its contents. Filename globs support `*` and `?` at the root only.
+ * Quoted (unusual-character) paths are never guessed safe.
+ */
+export function blockingStatusEntries(porcelain: string, disposable: readonly string[]): string[] {
+  return porcelain
+    .split(/\r?\n/)
+    .filter((line) => line.length > 0)
+    .filter((line) => {
+      if (!line.startsWith("!! ")) return true;
+      const path = line.slice(3);
+      if (path.startsWith('"')) return true;
+      return !disposable.some((entry) => {
+        if (entry.endsWith("/")) return path === entry || path.startsWith(entry);
+        if (path === entry) return true;
+        if (entry.includes("/") || entry.includes("\\") || path.includes("/") || path.includes("\\")) return false;
+        const pattern = entry.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+          .replace(/\*/g, ".*").replace(/\?/g, ".");
+        return new RegExp(`^${pattern}$`).test(path);
+      });
+    });
+}
+
+export interface RemovalSafety {
+  removable: boolean;
+  reason?: string;
+}
+
+/** Inspect every entry, including ignored output, without entering a link. */
+function worktreeLinks(path: string): string[] {
+  const links: string[] = [];
+  function visit(entry: string, root = false): void {
+    try {
+      const stat = lstatSync(entry);
+      if (stat.isSymbolicLink()) {
+        if (root) throw new Error("worktree root is a link");
+        links.push(entry);
+      } else if (stat.isDirectory()) {
+        for (const name of readdirSync(entry)) visit(join(entry, name));
+      } else if (root) {
+        throw new Error("worktree root is not a directory");
+      }
+    } catch (error) {
+      throw new Error(`cannot safely inspect ${entry}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  visit(resolve(path), true);
+  return links;
+}
+
+export interface ExternalLink { path: string; target: string }
+
+/** Include ignored entries, never entering a symlink or junction. Hard-link
+ * peers cannot be enumerated portably, so reject every nlink > 1 file. */
+export function externalLinks(worktree: string): ExternalLink[] {
+  const root = realpathSync.native(worktree);
+  const links: ExternalLink[] = [];
+  const outside = (target: string) => {
+    const rel = relative(root, target);
+    return rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel);
+  };
+  // Resolve existing ancestors even for dangling targets through other links.
+  const canonical = (path: string): string => {
+    try { return realpathSync.native(path); }
+    catch (error) {
+      if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      const parent = dirname(path);
+      if (parent === path) throw error;
+      return join(canonical(parent), relative(parent, path));
+    }
+  };
+  function visit(path: string): void {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      const target = resolve(dirname(path), readlinkSync(path));
+      // Compare canonical identities: Windows short names and ancestor aliases
+      // can spell an internal target as a path lexically outside the root.
+      if (outside(canonical(target))) links.push({ path: relative(root, path), target });
+    } else if (stat.isDirectory()) {
+      for (const name of readdirSync(path)) visit(join(path, name));
+    } else if (stat.isFile() && stat.nlink > 1) {
+      links.push({ path: relative(root, path), target: `unknown hard-link peer (link count ${stat.nlink}; conservatively rejected because external peers cannot be determined portably)` });
+    }
+  }
+  if (lstatSync(worktree).isSymbolicLink()) return [{ path: ".", target: root }];
+  visit(root);
+  return links;
+}
+
+export class ExternalLinksRejected extends Error {}
+
+/** Shared refusal text for coordinator completion and worker-invoked submit. */
+export function assertNoExternalLinks(worktree: string): void {
+  let links: ExternalLink[];
+  try { links = externalLinks(worktree); }
+  catch (error) {
+    throw new ExternalLinksRejected(`Worker links could not be inspected; worktree and claim retained. No verification, commit or submission.\n\n${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (links.length) throw new ExternalLinksRejected(
+    "Worker external links rejected; worktree and claim retained for inspection. No verification, commit or submission.\n\n" +
+    links.map(({ path, target }) => `- ${JSON.stringify(path)} -> ${JSON.stringify(target)}`).join("\n"),
+  );
+}
+
+/** Git for Windows can recurse through junctions, even without --force. */
+export function prepareWorktreeRemoval(path: string): boolean {
+  try {
+    for (const link of worktreeLinks(path)) {
+      try {
+        // Never use recursive rm or pass a trailing slash. Node's unlink removes
+        // both POSIX symlinks and Windows junctions without touching the target.
+        if (!lstatSync(link).isSymbolicLink()) throw new Error("link changed during cleanup");
+        unlinkSync(link);
+      } catch (error) {
+        throw new Error(`cannot safely unlink ${link}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return true;
+  } catch (error) {
+    log.warn(`worktree retained: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+/**
+ * The single safe-removal predicate shared by repair and every cleanup path:
+ * nothing dirty, untracked, or ignored-but-not-disposable, and HEAD reachable
+ * from a ref other than the checked-out branch.
+ */
+export async function worktreeRemovalSafety(
+  path: string,
+  registeredBranch: string,
+  disposable: readonly string[] = DEFAULT_DISPOSABLE_IGNORED,
+): Promise<RemovalSafety> {
+  try {
+    worktreeLinks(path);
+  } catch (error) {
+    return { removable: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  const status = await exec(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
+    { cwd: path },
+  );
+  if (status.code !== 0) return { removable: false, reason: "worktree status is unreadable" };
+  const blocking = blockingStatusEntries(status.stdout, disposable);
+  if (blocking.length > 0) {
+    const shown = blocking.slice(0, 3).map((line) => line.slice(3)).join(", ");
+    const more = blocking.length > 3 ? ` (+${blocking.length - 3} more)` : "";
+    return {
+      removable: false,
+      reason: `worktree has dirty, untracked, or non-disposable ignored files: ${shown}${more}`,
+    };
+  }
+
+  const refs = await exec(
+    "git",
+    [
+      "for-each-ref",
+      "--contains=HEAD",
+      "--format=%(refname)",
+      "refs/heads",
+      "refs/remotes",
+      "refs/tags",
+    ],
+    { cwd: path },
+  );
+  if (refs.code !== 0) return { removable: false, reason: "commit reachability is unreadable" };
+  const preserved = refs.stdout
+    .split(/\r?\n/)
+    .some((ref) => ref.length > 0 && ref !== registeredBranch);
+  return preserved
+    ? { removable: true }
+    : { removable: false, reason: "HEAD is not preserved by another branch, remote, or tag" };
+}
+
+/**
+ * Remove a worktree only when doing so cannot hide recoverable work. HEAD must
+ * be attached, safe per `worktreeRemovalSafety`, and reachable elsewhere.
+ */
+export async function removeWorktree(
+  path: string,
+  opts: { cwd?: string; disposableIgnored?: readonly string[] } = {},
+): Promise<boolean> {
+  if (!existsSync(path)) return false;
+
+  const cwd = opts.cwd ?? process.cwd();
+  let registered: RegisteredWorktree;
+  try {
+    registered = await registeredWorktree(path, cwd);
+  } catch {
+    return false;
+  }
+  if (registered.branch === null) return false;
+
+  const safety = await worktreeRemovalSafety(path, registered.branch, opts.disposableIgnored);
+  if (!safety.removable) return false;
+  if (!prepareWorktreeRemoval(path)) return false;
+
+  // Without --force, git still refuses tracked modifications or untracked
+  // files, so a change racing in after the check above is never discarded.
+  const r = await exec("git", ["worktree", "remove", path], { cwd });
+  return r.code === 0;
+}
+
+/** Explicitly discard a registered worktree, including any recoverable local files. */
+export async function discardWorktree(
+  path: string,
+  opts: { cwd?: string } = {},
+): Promise<boolean> {
+  // Discard authorizes deleting local work, never files beyond a link target.
+  if (!prepareWorktreeRemoval(path)) return false;
+  const r = await exec("git", ["worktree", "remove", "--force", path], { cwd: opts.cwd });
+  return r.code === 0;
+}

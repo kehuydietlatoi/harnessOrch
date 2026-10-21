@@ -1,0 +1,123 @@
+import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { detectUsageLimit, nextClockTime } from "../src/adapters/usage-limit.js";
+
+// Real Codex failure lines captured from logs/issue-66.jsonl.
+const CODEX_MSG =
+  "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:33 PM.";
+const codexLog =
+  '{"type":"thread.started","thread_id":"abc"}\n' +
+  `{"type":"error","message":${JSON.stringify(CODEX_MSG)}}\n` +
+  `{"type":"turn.failed","error":{"message":${JSON.stringify(CODEX_MSG)}}}\n`;
+
+const noon = new Date(2026, 9, 6, 12, 0, 0);
+
+describe("nextClockTime", () => {
+  it.each([
+    ["Jan 1st, 2027 1:02 PM", new Date(2027, 0, 1, 13, 2)],
+    ["October 22nd, 2026 12 PM", new Date(2026, 9, 22, 12)],
+    ["Oct 23rd, 2026 9am", new Date(2026, 9, 23, 9)],
+    ["Oct 19, 2026 12:07 AM", new Date(2026, 9, 19, 0, 7)],
+  ])("resolves an explicit local date: %s", (text, expected) => {
+    expect(nextClockTime(`try again at ${text}`, noon)).toBe(expected.toISOString());
+  });
+
+  it.each(["Feb 30th, 2026 12 AM", "Foo 19th, 2026 12 AM", "Oct 19th, 2026 13 PM", "Oct 19th, 2026 12:99 AM"])(
+    "rejects an invalid reset: %s", (text) => {
+      expect(nextClockTime(`try again at ${text}`, noon)).toBeNull();
+    },
+  );
+
+  it("resolves a later wall-clock time to today, local time", () => {
+    const at = new Date(nextClockTime("try again at 4:33 PM.", noon) as string);
+    expect([at.getHours(), at.getMinutes(), at.getDate()]).toEqual([16, 33, 6]);
+  });
+
+  it("rolls an already-passed time over to tomorrow", () => {
+    const at = new Date(nextClockTime("resets 9am", noon) as string);
+    expect([at.getHours(), at.getDate()]).toEqual([9, 7]);
+  });
+
+  it("handles 12 AM / 12 PM and returns null without a clock time", () => {
+    expect(new Date(nextClockTime("try again at 12:00 AM", noon) as string).getHours()).toBe(0);
+    expect(new Date(nextClockTime("try again at 12 PM", new Date(2026, 9, 6, 11, 0)) as string).getHours()).toBe(12);
+    expect(nextClockTime("try again later", noon)).toBeNull();
+  });
+});
+
+describe("detectUsageLimit", () => {
+  it.each(["error", "turn.failed"])("parses a Codex ordinal-date reset in a %s event as local time", (type) => {
+    const now = new Date(2026, 9, 18, 23, 55);
+    const message = "You've hit your usage limit. try again at Oct 19th, 2026 12:07 AM";
+    const event = type === "error" ? { type, message } : { type, error: { message } };
+    expect(detectUsageLimit(JSON.stringify(event), now)?.resetAt)
+      .toBe(new Date(2026, 9, 19, 0, 7).toISOString());
+  });
+
+  it("cools down the OpenCode retryable 503 fixture for ten minutes", () => {
+    const fixture = readFileSync(new URL("./fixtures/opencode-1.19.3/error-503-retryable.jsonl", import.meta.url), "utf8");
+    expect(detectUsageLimit(fixture, noon)?.resetAt).toBe(new Date(noon.getTime() + 600_000).toISOString());
+  });
+
+  it.each([
+    [{ "retry-after": "120" }, 120_000],
+    [{ "Retry-After": 120 }, 120_000],
+    [{}, 600_000],
+    [{ "retry-after": "invalid" }, 600_000],
+    [{ "x-ratelimit-reset": String(noon.getTime() / 1000 + 180) }, 180_000],
+    [{ "retry-after": new Date(noon.getTime() + 240_000).toUTCString() }, 240_000],
+  ])("uses 429 response headers %j", (responseHeaders, duration) => {
+    const event = { type: "error", error: { data: { statusCode: 429, responseHeaders } } };
+    expect(detectUsageLimit(JSON.stringify(event), noon)?.resetAt).toBe(new Date(noon.getTime() + duration).toISOString());
+  });
+
+  it("recognizes retryable errors without a status, but ignores auth and tool errors", () => {
+    expect(detectUsageLimit('{"type":"error","error":{"data":{"isRetryable":true}}}', noon)?.resetAt)
+      .toBe(new Date(noon.getTime() + 600_000).toISOString());
+    expect(detectUsageLimit('{"type":"error","error":{"data":{"statusCode":401}}}', noon)).toBeNull();
+    expect(detectUsageLimit('{"type":"tool_use","error":{"data":{"statusCode":503}}}', noon)).toBeNull();
+  });
+  it("recognises a Codex usage-limit failure and its reset time", () => {
+    const limit = detectUsageLimit(codexLog, noon);
+    expect(limit?.message).toContain("hit your usage limit");
+    expect(new Date(limit?.resetAt as string).getHours()).toBe(16);
+  });
+
+  it("recognises a rejected Claude rate_limit_event using its epoch resetsAt", () => {
+    const log = '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1787686200,"rateLimitType":"five_hour"}}';
+    const limit = detectUsageLimit(log, noon);
+    expect(limit?.resetAt).toBe(new Date(1787686200 * 1000).toISOString());
+    expect(limit?.message).toContain("five_hour");
+  });
+
+  it("recognises an is_error Claude result naming the limit", () => {
+    const log = '{"type":"result","is_error":true,"result":"5-hour limit reached ∙ resets 3pm"}';
+    const limit = detectUsageLimit(log, noon);
+    expect(new Date(limit?.resetAt as string).getHours()).toBe(15);
+  });
+
+  it("returns a limit with no reset time when the message names none", () => {
+    const log = '{"type":"error","message":"rate limit exceeded"}';
+    expect(detectUsageLimit(log, noon)).toEqual({ resetAt: null, message: "rate limit exceeded" });
+  });
+
+  it("ignores an allowed Claude rate_limit_event", () => {
+    const log = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1787686200}}';
+    expect(detectUsageLimit(log, noon)).toBeNull();
+    const warning = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"}}';
+    expect(detectUsageLimit(warning, noon)).toBeNull();
+  });
+
+  it("never treats ordinary assistant text about rate limits as a refusal", () => {
+    const log =
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"I added a usage limit and rate limit check"}]}}\n' +
+      '{"type":"result","is_error":false,"result":"Implemented the rate limit feature"}\n' +
+      "plain text: You have hit your usage limit\n";
+    expect(detectUsageLimit(log, noon)).toBeNull();
+  });
+
+  it("returns null for empty and malformed logs", () => {
+    expect(detectUsageLimit("", noon)).toBeNull();
+    expect(detectUsageLimit("{not json\n{\"type\":", noon)).toBeNull();
+  });
+});

@@ -1,0 +1,223 @@
+import { describe, expect, it } from "vitest";
+import {
+  buildClaudeInteractivePlanArgs,
+  buildClaudeReviewArgs,
+  buildClaudeTaskArgs,
+  resultTextFromClaudeStreamJson,
+} from "../src/adapters/claude.js";
+import {
+  codexDelegation,
+  buildCodexReviewArgs,
+  buildCodexTaskArgs,
+  resultTextFromCodexJson,
+  sessionIdFromCodexJson,
+} from "../src/adapters/codex.js";
+import { makeAdapter } from "../src/adapters/index.js";
+import { DEFAULT_CONFIG } from "../src/config.js";
+
+describe("task adapter arguments", () => {
+  it("sets a remaining USD cap for Claude task and review argv only when supplied", () => {
+    expect(buildClaudeTaskArgs(undefined, undefined, 1.25)).toContain("--max-budget-usd");
+    expect(buildClaudeTaskArgs(undefined, undefined, 1.25).slice(-2)).toEqual(["--max-budget-usd", "1.25"]);
+    expect(buildClaudeReviewArgs(undefined, 0.75).slice(-2)).toEqual(["--max-budget-usd", "0.75"]);
+    expect(buildClaudeTaskArgs()).not.toContain("--max-budget-usd");
+    expect(buildClaudeReviewArgs()).not.toContain("--max-budget-usd");
+  });
+  it("leaves Claude task arguments unchanged without a model", () => {
+    expect(buildClaudeTaskArgs()).toEqual([
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--permission-mode",
+      "acceptEdits",
+      "--allowedTools",
+      "Read,Edit,Write,Bash",
+    ]);
+  });
+
+  it("appends Claude's model and effort flags when a spec is set", () => {
+    expect(buildClaudeTaskArgs({ model: "claude-sonnet-5-5", effort: "medium" })).toEqual([
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--permission-mode",
+      "acceptEdits",
+      "--allowedTools",
+      "Read,Edit,Write,Bash",
+      "--model",
+      "claude-sonnet-5-5",
+      "--effort",
+      "medium",
+    ]);
+  });
+
+  it("emits only the Claude flag that the spec defines", () => {
+    expect(buildClaudeTaskArgs({ effort: "high" }).slice(-2)).toEqual(["--effort", "high"]);
+    expect(buildClaudeTaskArgs({ model: "opus" }).slice(-2)).toEqual(["--model", "opus"]);
+    expect(buildClaudeTaskArgs({ model: "opus" })).not.toContain("--effort");
+  });
+
+  it("leaves Codex task arguments unchanged without a model", () => {
+    expect(buildCodexTaskArgs()).toEqual(["exec", "--approve-for-me", "--json"]);
+  });
+
+  it("appends Codex's reasoning effort flag when only an effort is set", () => {
+    const args = buildCodexTaskArgs({ effort: "high" });
+    expect(args).toEqual([
+      "exec",
+      "--approve-for-me",
+      "--json",
+      "-c",
+      "model_reasoning_effort=high",
+    ]);
+    expect(args).not.toContain("-p");
+    expect(args).not.toContain("--output-format");
+    expect(args).not.toContain("--model");
+    expect(args).not.toContain("-m");
+  });
+
+  it("passes Codex's -m model before the effort override", () => {
+    expect(buildCodexTaskArgs({ model: "gpt-6-astra", effort: "medium" })).toEqual([
+      "exec",
+      "--approve-for-me",
+      "--json",
+      "-m",
+      "gpt-6-astra",
+      "-c",
+      "model_reasoning_effort=medium",
+    ]);
+  });
+});
+
+describe("session continuity arguments", () => {
+  const id = "e72ad3d7-549f-484d-8cf0-9d11145508fb";
+
+  it("starts a Claude conversation under a chosen id so it can be resumed later", () => {
+    const args = buildClaudeTaskArgs({ model: "m" }, { id, resume: false });
+    expect(args[args.indexOf("--session-id") + 1]).toBe(id);
+    expect(args).not.toContain("--resume");
+  });
+
+  it("resumes a Claude conversation by id", () => {
+    const args = buildClaudeTaskArgs({ model: "m", effort: "medium" }, { id, resume: true });
+    expect(args[args.indexOf("--resume") + 1]).toBe(id);
+    expect(args).not.toContain("--session-id");
+    expect(args.slice(-4)).toEqual(["--model", "m", "--effort", "medium"]);
+  });
+
+  it("leaves Claude arguments untouched without a session", () => {
+    expect(buildClaudeTaskArgs()).not.toContain("--session-id");
+    expect(buildClaudeTaskArgs()).not.toContain("--resume");
+  });
+
+  it("resumes Codex with exec options before the subcommand and the prompt on stdin", () => {
+    expect(buildCodexTaskArgs({ model: "gpt-6.1-sol", effort: "medium" }, id)).toEqual([
+      "exec", "--approve-for-me", "--json", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium",
+      "resume", id, "-",
+    ]);
+    expect(buildCodexTaskArgs({ effort: "high" })).not.toContain("resume");
+  });
+
+  it("reads the newest Codex thread id from a log", () => {
+    const log =
+      '{"type":"thread.started","thread_id":"old-1"}\n' +
+      '{"type":"turn.started"}\n' +
+      "not json thread.started\n" +
+      '{"type":"thread.started","thread_id":"new-2"}\n';
+    expect(sessionIdFromCodexJson(log)).toBe("new-2");
+    expect(sessionIdFromCodexJson('{"type":"turn.started"}')).toBeUndefined();
+    expect(sessionIdFromCodexJson("")).toBeUndefined();
+  });
+});
+
+describe("read-only reviewer arguments", () => {
+  it("gives Claude read tools only and explicitly denies edits and shell", () => {
+    const args = buildClaudeReviewArgs({ model: "claude-sonnet-5-5", effort: "medium" });
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("Read,Grep,Glob");
+    const denied = args[args.indexOf("--disallowedTools") + 1].split(",");
+    expect(denied).toEqual(expect.arrayContaining(["Edit", "Write", "Bash"]));
+    expect(args).not.toContain("acceptEdits");
+    expect(args.slice(-4)).toEqual(["--model", "claude-sonnet-5-5", "--effort", "medium"]);
+  });
+
+  it("runs Codex in its read-only sandbox without auto-approval", () => {
+    const args = buildCodexReviewArgs({ model: "gpt-6.1-sol", effort: "medium" });
+    expect(args).toEqual(["exec", "--json", "-s", "read-only", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium"]);
+    expect(args).not.toContain("--approve-for-me");
+    expect(buildCodexReviewArgs()).toEqual(["exec", "--json", "-s", "read-only"]);
+  });
+});
+
+describe("codexDelegation (stall guard)", () => {
+  const line = (o: unknown): string => JSON.stringify(o);
+
+  it("flags a collab tool call and a spawn_agent tool/name", () => {
+    expect(codexDelegation(line({ type: "item.started", item: { id: "i1", type: "collab_tool_call", tool: "spawn_agent" } })))
+      .toMatch(/sub-agents/);
+    expect(codexDelegation(line({ type: "item.started", item: { type: "mcp_tool_call", tool: "spawn_agent" } }))).toBeDefined();
+    expect(codexDelegation(line({ type: "response_item", name: "spawn_agent" }))).toBeDefined();
+  });
+
+  it("ignores assistant text and reasoning that merely mention spawn_agent", () => {
+    expect(codexDelegation(line({ type: "item.completed", item: { type: "agent_message", text: "I will not use spawn_agent" } }))).toBeUndefined();
+    expect(codexDelegation(line({ type: "item.completed", item: { type: "reasoning", text: "spawn_agent is off" } }))).toBeUndefined();
+  });
+
+  it("ignores ordinary events and non-JSON lines", () => {
+    expect(codexDelegation(line({ type: "item.completed", item: { type: "command_execution", command: "ls" } }))).toBeUndefined();
+    expect(codexDelegation("spawn_agent not json")).toBeUndefined();
+    expect(codexDelegation("")).toBeUndefined();
+  });
+});
+
+describe("lead adapter capabilities", () => {
+  it("supports structured planner/judge runs with both built-in adapters", () => {
+    expect(makeAdapter("claude", DEFAULT_CONFIG).runHeadless).toBeTypeOf("function");
+    expect(makeAdapter("codex", DEFAULT_CONFIG).runHeadless).toBeTypeOf("function");
+  });
+
+  it("supports interactive planning only where the adapter defines it", () => {
+    expect(makeAdapter("claude", DEFAULT_CONFIG).runInteractivePlan).toBeTypeOf("function");
+    expect(makeAdapter("codex", DEFAULT_CONFIG).runInteractivePlan).toBeUndefined();
+  });
+});
+
+
+describe("structured lead output", () => {
+  it("reduces Claude stream-json to the final result", () => {
+    const log =
+      '{"type":"system","subtype":"init"}\n' +
+      '{"type":"result","result":"FIRST"}\n' +
+      '{"type":"result","result":"FINAL TEXT"}\n';
+    expect(resultTextFromClaudeStreamJson(log)).toBe("FINAL TEXT");
+  });
+
+  it("reduces Codex JSONL to the final completed agent message", () => {
+    const log =
+      '{"type":"thread.started","thread_id":"abc"}\n' +
+      '{"type":"item.completed","item":{"type":"agent_message","text":"FIRST"}}\n' +
+      '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"ignored"}}\n' +
+      '{"type":"item.completed","item":{"type":"agent_message","text":"FINAL TEXT"}}\n';
+    expect(resultTextFromCodexJson(log)).toBe("FINAL TEXT");
+  });
+
+  it("ignores malformed and unrelated structured lines", () => {
+    expect(resultTextFromClaudeStreamJson('not-json\n{"type":"assistant"}\n')).toBe("");
+    expect(resultTextFromCodexJson('not-json\n{"type":"turn.completed"}\n')).toBe("");
+  });
+});
+
+describe("Claude interactive planning arguments", () => {
+  it("carries the seed, allows Write, and sets the model", () => {
+    const args = buildClaudeInteractivePlanArgs({ model: "opus", effort: "high" }, "SEED");
+    expect(args[args.indexOf("--append-system-prompt") + 1]).toBe("SEED");
+    expect(args).toContain("Write");
+    expect(args.slice(-4)).toEqual(["--model", "opus", "--effort", "high"]);
+  });
+
+  it("omits --model when none is configured", () => {
+    expect(buildClaudeInteractivePlanArgs(undefined, "SEED")).not.toContain("--model");
+  });
+});
