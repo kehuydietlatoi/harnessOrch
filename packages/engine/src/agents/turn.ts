@@ -157,14 +157,20 @@ export function reduceClaude(raw: string): Omit<TurnResult, "code" | "timedOut" 
   let text = "";
   let structured: unknown;
   let sessionId: string | undefined;
+  let finished = false;
+  // Per request (one message id can span several stream events): the fallback when the turn was killed before "result".
+  const requests = new Map<string, Json>();
   for (const e of events) {
     if (typeof e.session_id === "string") sessionId = e.session_id;
     if (e.type === "assistant") {
-      const u = obj(obj(e.message).usage);
+      const message = obj(e.message);
+      const u = obj(message.usage);
       const ctx = num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens);
       if (ctx > 0) usage.contextTokens = ctx;
+      requests.set(typeof message.id === "string" ? message.id : `r${requests.size}`, u);
     }
     if (e.type === "result") {
+      finished = true;
       const u = obj(e.usage);
       usage.input = num(u.input_tokens);
       usage.cacheRead = num(u.cache_read_input_tokens);
@@ -174,6 +180,15 @@ export function reduceClaude(raw: string): Omit<TurnResult, "code" | "timedOut" 
       if (typeof e.result === "string") text = e.result;
       if (e.structured_output !== undefined) structured = e.structured_output;
     }
+  }
+  if (!finished) {
+    for (const u of requests.values()) {
+      usage.input += num(u.input_tokens);
+      usage.cacheRead += num(u.cache_read_input_tokens);
+      usage.cacheWrite += num(u.cache_creation_input_tokens);
+      usage.output += num(u.output_tokens);
+    }
+    usage.requests = requests.size;
   }
   if (!usage.contextTokens) usage.contextTokens = Math.round((usage.input + usage.cacheRead + usage.cacheWrite) / Math.max(1, usage.requests));
   return { text, sessionId, usage, ...(structured !== undefined ? { structured } : {}) };

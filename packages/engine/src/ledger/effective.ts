@@ -38,21 +38,34 @@ export function addUsage(a: TurnUsage, b: TurnUsage): TurnUsage {
  * turn can only be stopped by its timeout).
  */
 export function budgetWatcher(agent: string, limit: number, w: CacheWeights = DEFAULT_WEIGHTS): (line: string) => string | undefined {
-  let spent = 0;
+  // Claude streams one "assistant" event per content block (thinking, text, each tool call),
+  // all repeating the same request's usage: count each request once, by message id.
+  const perRequest = new Map<string, number>();
+  let steps = 0;
   return (line) => {
     if (!line.startsWith("{")) return undefined;
     let e: Record<string, unknown>;
     try { e = JSON.parse(line) as Record<string, unknown>; } catch { return undefined; }
     let u: Record<string, unknown> | undefined;
-    if (agent === "claude" && e.type === "assistant") u = (e.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined;
+    let id: string | undefined;
+    if (agent === "claude" && e.type === "assistant") {
+      const message = e.message as Record<string, unknown> | undefined;
+      u = message?.usage as Record<string, unknown> | undefined;
+      id = typeof message?.id === "string" ? message.id : undefined;
+    }
     if (agent === "opencode" && e.type === "step_finish") {
       const t = ((e.part as Record<string, unknown> | undefined)?.tokens ?? {}) as Record<string, unknown>;
       const cache = (t.cache ?? {}) as Record<string, unknown>;
       u = { input_tokens: t.input, output_tokens: t.output, cache_read_input_tokens: cache.read, cache_creation_input_tokens: cache.write };
     }
     if (!u) return undefined;
-    const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-    spent += effectiveTokens({ input: n(u.input_tokens), cacheRead: n(u.cache_read_input_tokens), cacheWrite: n(u.cache_creation_input_tokens), output: n(u.output_tokens) }, w);
+    perRequest.set(id ?? `step-${steps++}`, effectiveTokens(usageFrom(u), w));
+    const spent = [...perRequest.values()].reduce((a, b) => a + b, 0);
     return spent > limit ? `token budget exceeded (${spent} > ${limit} effective tokens)` : undefined;
   };
+}
+
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+function usageFrom(u: Record<string, unknown>): { input: number; cacheRead: number; cacheWrite: number; output: number } {
+  return { input: num(u.input_tokens), cacheRead: num(u.cache_read_input_tokens), cacheWrite: num(u.cache_creation_input_tokens), output: num(u.output_tokens) };
 }

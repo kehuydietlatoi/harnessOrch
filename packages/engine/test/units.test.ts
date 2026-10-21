@@ -145,6 +145,21 @@ describe("effective tokens", () => {
     expect(cacheHitRate({ input: 0, cacheRead: 0, cacheWrite: 0 })).toBeNull();
   });
 
+  it("counts each Claude request once, though it streams one event per content block", () => {
+    const watch = budgetWatcher("claude", 1000);
+    const block = (id: string) => j({ type: "assistant", message: { id, usage: { input_tokens: 300, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 100 } } });
+    // Thinking, text and three tool calls of the same request: 400, not 2000.
+    for (let i = 0; i < 5; i++) expect(watch(block("msg_1"))).toBeUndefined();
+    expect(watch(block("msg_2"))).toBeUndefined();
+    expect(watch(block("msg_3"))).toMatch(/1200 > 1000/);
+  });
+
+  it("records the real usage of a Claude turn killed before its result", () => {
+    const block = (id: string, extra: object) => j({ type: "assistant", message: { id, usage: { input_tokens: 2, cache_read_input_tokens: 1000, cache_creation_input_tokens: 50, output_tokens: 30, ...extra } } });
+    const raw = [block("a", {}), block("a", {}), block("b", { cache_read_input_tokens: 2000 })].join("\n");
+    expect(reduceClaude(raw).usage).toMatchObject({ input: 4, cacheRead: 3000, cacheWrite: 100, output: 60, requests: 2 });
+  });
+
   it("stops a Claude turn once the live total passes its budget", () => {
     const watch = budgetWatcher("claude", 1000);
     const step = j({ type: "assistant", message: { usage: { input_tokens: 400, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 100 } } });

@@ -266,6 +266,16 @@ export class PlanRunner extends EventEmitter {
     });
   }
 
+  /** Everything one agent contributed to the plan, as reviewed: its tasks' commits plus its review fixes. */
+  async authorDiff(agent: string): Promise<string> {
+    const tasks = this.store.tasks(this.key).filter((r) => r.agent === agent && r.status === "done");
+    const commits = tasks.flatMap((r) => this.commitsOf(r.id));
+    const fixes = (await g.tryGit(this.repo, ["log", "--all", "--reverse", "--format=%H%x09%s", "--fixed-strings", `--grep=Review fixes (${agent})`])).stdout
+      .split(/\r?\n/).map((l) => l.split("\t")).filter(([, s]) => s === `Review fixes (${agent})`).map(([h]) => h);
+    const all = [...new Set([...commits, ...(this.fixCommits.get(agent) ?? []), ...fixes])];
+    return all.length ? (await g.commitsDiff(this.repo, all)).diff : "";
+  }
+
   /** The patches of a task's commits on the plan branch (empty before its first merge). */
   async taskDiff(taskId: string): Promise<string> {
     let commits = this.commitsOf(taskId);

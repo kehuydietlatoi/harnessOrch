@@ -4,6 +4,7 @@ import { Board } from "./Board";
 import { Drawer, useTerminals } from "./Drawer";
 import { banner, formatLine } from "./format";
 import { StatusStrip } from "./StatusStrip";
+import { ReviewPanel } from "./ReviewPanel";
 import { TaskPanel } from "./TaskPanel";
 
 /** Dev/screenshot hook: `#task=T1&tab=activity` preselects a task and drawer tab. */
@@ -41,7 +42,11 @@ export function App() {
   useEffect(() => { if (repo) void refreshPlans(); }, [repo, refreshPlans]);
   useEffect(() => { void refreshSnap(); }, [refreshSnap]);
   useEffect(() => api.on("plans:changed", () => { void refreshPlans(); void refreshSnap(); }), [refreshPlans, refreshSnap]);
-  useEffect(() => { if (selected && snap && !snap.tasks.some((t) => t.id === selected)) setSelected(null); }, [snap, selected]);
+  useEffect(() => {
+    if (!selected || !snap) return;
+    const known = selected.startsWith("review:") ? snap.reviews.some((r) => `review:${r.agent}` === selected) : snap.tasks.some((t) => t.id === selected);
+    if (!known) setSelected(null);
+  }, [snap, selected]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => { if (e.key === "Escape") setSelected(null); };
     window.addEventListener("keydown", onKey);
@@ -73,6 +78,7 @@ export function App() {
   const latestReview = (snap?.reviews ?? []).filter((r, _i, all) => !all.some((x) => x.agent === r.agent && x.round > r.round));
   const blockedReviews = latestReview.filter((r) => r.decision === "request-changes");
   const task = snap?.tasks.find((t) => t.id === selected) ?? null;
+  const reviewAgent = selected?.startsWith("review:") ? selected.slice(7) : null;
   const events: EventView[] = snap?.events ?? [];
 
   return (
@@ -103,7 +109,7 @@ export function App() {
         {snap?.warnings.map((w) => <div key={w} className="banner warn">{w}</div>)}
       </div>
 
-      <main className={task ? "with-panel" : ""}>
+      <main className={task || reviewAgent ? "with-panel" : ""}>
         {snap ? (
           <Board snap={snap} selected={selected} onSelect={(id) => setSelected((cur) => (cur === id ? null : id))}
             blockedReviews={blockedReviews} onReview={(agent, action) => void guard(api.call("plan:review", planFile, agent, action))} />
@@ -116,6 +122,9 @@ export function App() {
         )}
         {task && snap && planFile &&
           <TaskPanel snap={snap} task={task} planFile={planFile} initialTab={initialHash.get("ptab")} onClose={() => setSelected(null)} onError={setError} onChanged={refreshSnap} />}
+        {reviewAgent && snap && planFile &&
+          <ReviewPanel snap={snap} agent={reviewAgent} planFile={planFile} onClose={() => setSelected(null)} onSelectTask={setSelected}
+            onReview={async (action) => { if (await guard(api.call("plan:review", planFile, reviewAgent, action)) !== undefined) { setSelected(null); void refreshSnap(); } }} />}
       </main>
 
       <Drawer term={term} snap={snap} events={events} repo={repo} planFile={planFile} blockedReviews={blockedReviews.length} />

@@ -221,6 +221,7 @@ handle("plan:taskDiff", async (file: string, taskId: string) => {
   // Commits live in the shared object store: no need to (re)create worktrees just to read a diff.
   return runnerFor(file).taskDiff(taskId);
 });
+handle("plan:authorDiff", (file: string, agent: string) => runnerFor(file).authorDiff(agent));
 handle("log:open", (path: string) => shell.openPath(path));
 handle("pty:planner", (cols: number, rows: number) => spawnPlanner(cols, rows));
 handle("pty:takeover", (file: string, agent: AgentId, cols: number, rows: number) => spawnTakeover(file, agent, cols, rows));

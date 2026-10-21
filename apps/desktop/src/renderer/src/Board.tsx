@@ -33,13 +33,11 @@ export function Board(props: {
                   waitingOn={t.status === "pending" ? t.dependsOn.filter((d) => !doneIds.has(d)) : []} onClick={() => props.onSelect(t.id)} />
               ))}
               {col.status === "paused" && props.blockedReviews.map((r) => (
-                <div key={r.agent} className="card review">
+                <div key={r.agent} className={`card review ${props.selected === `review:${r.agent}` ? "selected" : ""}`} role="button" tabIndex={0}
+                  onClick={() => props.onSelect(`review:${r.agent}`)} onKeyDown={(e) => { if (e.key === "Enter") props.onSelect(`review:${r.agent}`); }}>
                   <div className="card-head"><b>Review · {r.agent}</b><span className="badge">round {r.round}</span></div>
                   <p className="note clamp">{r.notes}</p>
-                  <div className="row">
-                    <button className="small" onClick={() => props.onReview(r.agent, "approve")}>Approve anyway</button>
-                    <button className="small" onClick={() => props.onReview(r.agent, "retry")}>Review again</button>
-                  </div>
+                  <div className="meta"><span>rejected by {r.reviewer}</span><span className="tok">open for details</span></div>
                 </div>
               ))}
             </div>
