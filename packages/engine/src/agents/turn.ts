@@ -70,8 +70,11 @@ export const CLAUDE_READ_TOOLS = "Read,Grep,Glob";
 /** Never auto-approved, even though Bash is. */
 export const CLAUDE_RISKY_BASH = [
   "Bash(git push:*)", "Bash(git reset --hard:*)", "Bash(git clean:*)", "Bash(git checkout -- :*)",
-  "Bash(npm install:*)", "Bash(npm i :*)", "Bash(npm ci:*)", "Bash(npm update:*)", "Bash(pnpm add:*)", "Bash(pnpm install:*)",
-  "Bash(pnpm i:*)", "Bash(yarn add:*)", "Bash(yarn install:*)", "Bash(bun install:*)", "Bash(bun add:*)", "Bash(pip install:*)",
+  // Adding dev dependencies is allowed (the engine reverts production-dependency changes);
+  // full reinstalls, upgrades and removals are not.
+  "Bash(npm ci:*)", "Bash(npm update:*)", "Bash(npm uninstall:*)", "Bash(npm remove:*)", "Bash(npm audit fix:*)",
+  "Bash(pnpm install:*)", "Bash(pnpm update:*)", "Bash(pnpm remove:*)", "Bash(yarn install:*)", "Bash(yarn upgrade:*)",
+  "Bash(yarn remove:*)", "Bash(bun install:*)", "Bash(bun update:*)", "Bash(bun remove:*)",
   "Bash(rm -rf /:*)", "Bash(curl:*)", "Bash(wget:*)",
 ];
 
@@ -99,6 +102,11 @@ export function claudeTurnArgs(req: Pick<TurnRequest, "model" | "readOnly" | "sc
 export function claudeEnv(adapter?: AdapterConfig): NodeJS.ProcessEnv {
   return { ...workerEnvironment("claude", adapter?.env), ENABLE_CLAUDEAI_MCP_SERVERS: "false", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" };
 }
+
+/** OpenCode bash patterns for adding dev dependencies (its default is deny-all). */
+export const OPENCODE_DEV_INSTALLS = [
+  "npm install -D *", "npm i -D *", "npm install --save-dev *", "pnpm add -D *", "yarn add -D *", "bun add -d *", "npx playwright install*",
+];
 
 /** Codex features a coding worker never needs; disabling them roughly halves the baseline (M0: 49k → 27k). */
 export const CODEX_DISABLED_FEATURES = [
@@ -264,7 +272,12 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
     } else {
       const config = join(state, "opencode.json");
       const permission = opencodePermissions(realpathSync(req.cwd), req.readOnly);
-      if (!req.readOnly) for (const c of req.checkCommands ?? []) (permission.bash as Record<string, string>)[hverifyCommand(c)] = "allow";
+      if (!req.readOnly) {
+        const bash = permission.bash as Record<string, string>;
+        for (const c of req.checkCommands ?? []) bash[hverifyCommand(c)] = "allow";
+        // Adding dev dependencies is allowed for every agent; the engine reverts production-dependency changes.
+        for (const p of OPENCODE_DEV_INSTALLS) bash[p] = "allow";
+      }
       writeFileSync(config, JSON.stringify({ permission }), { mode: 0o600 });
       cmd = req.adapter?.cmd ?? "opencode";
       args = opencodeTurnArgs(req);

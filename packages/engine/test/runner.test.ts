@@ -19,6 +19,7 @@ function task(id: string, title: string, yaml: string): string {
 let root: string;
 let repo: string;
 let store: Store;
+let installs: string[] = [];
 const KEY = (): string => `${repo.replaceAll("\\", "/").toLowerCase()}#demo`;
 
 function sh(cwd: string, ...args: string[]): string {
@@ -36,6 +37,7 @@ beforeEach(() => {
   sh(repo, "add", "-A");
   sh(repo, "commit", "-q", "-m", "init");
   store = new Store(":memory:");
+  installs = [];
 });
 afterEach(() => {
   store.close();
@@ -79,7 +81,7 @@ const taskId = (prompt: string): string | undefined => /# Task (\S+):|Task (\S+)
 
 function runner(planFile: string, runTurn: (r: TurnRequest) => Promise<TurnResult>, events: RunnerEvent[] = []) {
   const r = new PlanRunner({ repo, planFile, store, config: { ...DEFAULT_CONFIG, maxAttempts: 2 }, worktreeRoot: join(root, "wt"),
-    skillsRoot: join(root, "no-skills"), deps: { runTurn, sleep: async () => undefined } });
+    skillsRoot: join(root, "no-skills"), deps: { runTurn, sleep: async () => undefined, installDeps: async (cwd) => { installs.push(cwd); return { ok: true, output: "" }; } } });
   r.on("event", (e: RunnerEvent) => { if (e.type !== "line") events.push(e); });
   return r;
 }
@@ -344,6 +346,53 @@ describe("plan runner", { timeout: 90_000 }, () => {
     expect(sh(repo, "show", "harness/demo:src/T1.txt")).toBe("first half");
     expect(sh(repo, "show", "harness/demo:src/T1b.txt")).toBe("second half");
     expect(calls.filter((c) => c.prompt.startsWith("# Task T1"))).toHaveLength(1);
+  });
+
+  it("keeps dev dependencies an agent adds, and reverts production ones the plan did not list", async () => {
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "g", dependencies: { a: "1.0.0" } }, null, 2));
+    sh(repo, "add", "package.json");
+    sh(repo, "commit", "-q", "-m", "manifest");
+    const plan = writePlan([
+      task("T1", "Dev dep", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`),
+      task("T2", "Prod dep", `agent: claude\ndepends_on: [T1]\ngoal: g\nwrite_scope: [src/T2.txt]`),
+    ].join("\n"));
+    const manifest = (extra: object): string => JSON.stringify({ name: "g", ...extra }, null, 2);
+    const { calls, runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.startsWith("# Task T1")) return { ...done(), write: { "src/T1.txt": "x", "package.json": manifest({ dependencies: { a: "1.0.0" }, devDependencies: { playwright: "^1" } }) } };
+      if (req.prompt.startsWith("# Task T2")) return { ...done(), write: { "src/T2.txt": "x", "package.json": manifest({ dependencies: { a: "1.0.0", lodash: "4" }, devDependencies: { playwright: "^1" } }) } };
+      return { ...done(), write: { "src/T2.txt": "fixed" } };
+    });
+    expect(await runner(plan, runTurn).run()).toBe("ready");
+    const merged = JSON.parse(sh(repo, "show", "harness/demo:package.json")) as { dependencies: object; devDependencies: object };
+    expect(merged.devDependencies).toEqual({ playwright: "^1" });
+    expect(merged.dependencies).toEqual({ a: "1.0.0" });
+    // The plan worktree installed the new dev dependency before running the plan checks.
+    expect(installs.some((p) => p.replaceAll("\\", "/").endsWith("/wt/plan"))).toBe(true);
+    // T2's production dependency was reverted by the engine, without a turn spent asking.
+    expect(calls.filter((c) => c.prompt.includes("Task T2"))).toHaveLength(1);
+  });
+
+  it("refuses a bare resume of a blocked question, and lets you skip a task", async () => {
+    const plan = writePlan([
+      task("T1", "Asks", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`),
+      task("T2", "After", `agent: codex\ndepends_on: [T1]\ngoal: g\nwrite_scope: [src/T2.txt]`),
+    ].join("\n"));
+    const { runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("You are the orchestrator")) return { structured: { action: "human", agent: "", guidance: "ask the user" } };
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.includes("Task T1")) return { structured: { status: "blocked", summary: "?", files_changed: [], decisions: [], questions: ["which one?"] } };
+      return { ...done(), write: { "src/T2.txt": "x" } };
+    });
+    const r = runner(plan, runTurn);
+    expect(await r.run()).toBe("paused");
+    expect(() => r.resumeTask("T1")).toThrow(/waiting for an answer/);
+    expect(() => r.resumeTask("T1", { guidance: "   " })).toThrow(/waiting for an answer/);
+    r.skipTask("T1");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "done", summary: "Skipped by you." });
+    expect(readFileSync(plan, "utf8")).toContain("- [x] **T1 — Asks**");
+    expect(await r.run()).toBe("ready");
+    expect(store.task(KEY(), "T2")?.status).toBe("done");
   });
 
   it("refuses to start an invalid plan", async () => {

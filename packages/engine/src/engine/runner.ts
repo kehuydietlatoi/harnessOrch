@@ -15,6 +15,7 @@ import { blockedBy, nextDispatches, planFinished, type SchedTask } from "../sche
 import { listSkills, selectSkills, type Skill, type SkillRole } from "../skills/skills.js";
 import type { PlanStatus, RunPhase, Store } from "../store/store.js";
 import * as g from "./git.js";
+import { dependencyViolations, installDeps, isManifest, MANIFEST_GLOBS } from "./deps.js";
 import { prepareWorktreeRemoval } from "../git/worktree.js";
 
 export interface RunnerDeps {
@@ -22,6 +23,7 @@ export interface RunnerDeps {
   runChecks: (commands: readonly string[], cwd: string, logDir: string, timeoutMs?: number) => Promise<CheckResult[]>;
   now: () => Date;
   sleep: (ms: number) => Promise<void>;
+  installDeps: (cwd: string) => Promise<{ ok: boolean; output: string }>;
 }
 
 export interface RunnerOptions {
@@ -111,7 +113,7 @@ export class PlanRunner extends EventEmitter {
     this.key = planKey(this.repo, this.planPath);
     this.cfg = opts.config ?? DEFAULT_CONFIG;
     this.store = opts.store;
-    this.deps = { runTurn: defaultRunTurn, runChecks: defaultRunChecks, now: () => new Date(), sleep, ...opts.deps };
+    this.deps = { runTurn: defaultRunTurn, runChecks: defaultRunChecks, now: () => new Date(), sleep, installDeps, ...opts.deps };
     this.skills = listSkills(opts.skillsRoot);
     this.wtRoot = opts.worktreeRoot ?? join(dirname(this.repo), ".harness-wt", basename(this.repo), this.id);
     this.stateDir = join(orchHome(), projectId(this.repo), this.id);
@@ -426,7 +428,7 @@ export class PlanRunner extends EventEmitter {
     const resumedByHuman = this.resumed.delete(t.id);
     if (!continuing) {
       if (await g.stashWip(lane.path, `harnessOrch leftover before ${t.id}`)) this.say({ type: "info", message: `${agent} lane had leftover changes; stashed` });
-      await g.syncLane(lane.path, this.planBranch);
+      await this.syncLaneDeps(lane);
       // A human resume puts the paused attempt's work back instead of redoing it from scratch.
       const parked = resumedByHuman ? await g.findStash(lane.path, this.parkLabel(t)) : null;
       if (parked && await g.applyStash(lane.path, parked)) {
@@ -497,7 +499,8 @@ export class PlanRunner extends EventEmitter {
   /** The engine's own definition of done: scope, then checks. */
   private async verify(t: PlanTask, lane: Lane): Promise<{ reason: string; details: string } | null> {
     const paths = await changedPaths(lane.path);
-    const violations = scopeViolations(paths, t.writeScope, this.protectedPaths);
+    // Manifests are always in scope: agents may add dev dependencies on their own.
+    const violations = scopeViolations(paths, [...t.writeScope, ...MANIFEST_GLOBS], this.protectedPaths);
     // Revert out-of-scope edits ourselves instead of spending a turn asking the worker to.
     let reverted = "";
     if (violations.length) {
@@ -505,11 +508,50 @@ export class PlanRunner extends EventEmitter {
       reverted = `The engine reverted changes outside your write scope (${t.writeScope.join(", ")}): ${violations.map((v) => `${v.path} (${v.reason})`).join(", ")}.`;
       this.say({ type: "info", message: `${t.id}: ${reverted}` });
     }
+    const depsProblem = await this.guardDependencies(lane, paths, t.deps);
+    if (depsProblem) {
+      reverted = [reverted, depsProblem].filter(Boolean).join("\n");
+      this.say({ type: "info", message: `${t.id}: ${depsProblem}` });
+    }
     const checks = t.checks.length ? t.checks : this.plan.header.checks;
     if (!checks.length) return null;
     const results = await this.deps.runChecks(checks, lane.path, join(this.stateDir, "checks"));
     if (checksPassed(results)) return null;
     return { reason: "checks failed", details: [reverted, formatCheckFailures(results)].filter(Boolean).join("\n\n") };
+  }
+
+  /**
+   * Dev dependencies are the agent's call; production dependencies and changes to
+   * existing packages are not. On a violation, revert every manifest and lockfile
+   * the task touched (re-adding the allowed dev dependencies is the agent's job).
+   */
+  private async guardDependencies(lane: Lane, paths: readonly string[], allowed: readonly string[] = []): Promise<string | null> {
+    const problems: string[] = [];
+    for (const path of paths.filter((p) => /(^|\/)package\.json$/.test(p))) {
+      const before = await g.tryGit(lane.path, ["show", `HEAD:${path}`]);
+      let after: string | null = null;
+      try { after = readFileSync(join(lane.path, path), "utf8"); } catch { /* deleted */ }
+      problems.push(...dependencyViolations(before.code === 0 ? before.stdout : null, after, allowed).map((v) => `${path} ${v}`));
+    }
+    if (!problems.length) return null;
+    await g.revertPaths(lane.path, paths.filter(isManifest));
+    return `Dependency rule: only new dev dependencies may be added. Reverted package.json and lockfiles because of: ${problems.join("; ")}.`;
+  }
+
+  /** Install in a worktree whose manifests changed between two commits (after a merge or a lane sync). */
+  private async syncDeps(cwd: string, from: string, to: string, where: string): Promise<void> {
+    if (from === to) return;
+    const changed = (await g.tryGit(cwd, ["diff", "--name-only", from, to])).stdout.split(/\r?\n/).filter(Boolean);
+    if (!changed.some(isManifest)) return;
+    const r = await this.deps.installDeps(cwd);
+    this.say({ type: "info", message: r.ok ? `dependencies changed; installed them in the ${where} worktree` : `installing changed dependencies in the ${where} worktree failed:\n${r.output}` });
+  }
+
+  /** Fast-forward a lane onto the plan branch, then match its dependencies. */
+  private async syncLaneDeps(lane: Lane): Promise<void> {
+    const before = await g.headSha(lane.path);
+    await g.syncLane(lane.path, this.planBranch);
+    await this.syncDeps(lane.path, before, await g.headSha(lane.path), lane.agent);
   }
 
   /** Commit in the lane, merge into the plan branch, run plan checks, tick the box. */
@@ -520,7 +562,7 @@ export class PlanRunner extends EventEmitter {
     if (sha) {
       outcome = await this.serialMerge(() => this.mergeLane(t, lane));
       // Merged (or kept despite failing plan checks): the lane fast-forwards onto the plan branch.
-      await g.syncLane(lane.path, this.planBranch);
+      await this.syncLaneDeps(lane);
       // Every commit that reached the plan branch belongs to the task and to its author's review.
       if (outcome === true || !outcome.notMerged) this.store.updateTask(this.key, t.id, { commitSha: [...prior, sha].join(" ") });
     } else if (prior.length) {
@@ -541,6 +583,7 @@ export class PlanRunner extends EventEmitter {
   }
 
   private async mergeLane(t: PlanTask, lane: Lane): Promise<true | MergeFailure> {
+    const before = await g.headSha(this.planWorktree);
     const m = await g.mergeNoFf(this.planWorktree, lane.branch, `Merge ${t.id}: ${t.title}`, lane.agent);
     if (!m.merged) {
       const resolved = await this.resolveConflict(t, m.conflicts);
@@ -549,11 +592,13 @@ export class PlanRunner extends EventEmitter {
         // Uncommit in the lane so the worker can rebuild on top of the plan branch.
         await g.git(lane.path, ["reset", "-q", "--mixed", "HEAD~1"]);
         await g.discardChanges(lane.path);
-        await g.syncLane(lane.path, this.planBranch);
+        await this.syncLaneDeps(lane);
         return { reason: "merge conflict the orchestrator could not resolve", notMerged: true,
           details: `Conflicted files: ${m.conflicts.join(", ")}. Redo the task on top of the latest plan branch.` };
       }
     }
+    // New dev dependencies from the lane must exist here before the plan checks run.
+    await this.syncDeps(this.planWorktree, before, await g.headSha(this.planWorktree), "plan");
     // A failure keeps the merge; the lane fast-forwards onto it and the worker fixes forward.
     return this.planChecks();
   }
@@ -644,14 +689,30 @@ export class PlanRunner extends EventEmitter {
   /** The human answered: retry the task, optionally with guidance or a different agent. */
   resumeTask(taskId: string, opts: { guidance?: string; agent?: AgentId } = {}): void {
     const t = this.task(taskId);
+    const row = this.store.task(this.key, taskId);
+    // A blocked agent asked a question; resending the same task without an answer just buys the same question again.
+    if (row?.status === "paused" && row.note?.startsWith("the agent is blocked") && !opts.guidance?.trim() && (!opts.agent || opts.agent === row.agent)) {
+      throw new Error(`${taskId} is waiting for an answer to its question. Write your answer in the box, pick another agent, or skip the task.`);
+    }
     if (opts.guidance) this.guidance.set(taskId, opts.guidance);
-    const current = this.store.task(this.key, taskId)?.agent;
+    const current = row?.agent;
     if (opts.agent && opts.agent !== current) this.reassign(t, opts.agent);
     else this.resumed.add(taskId);
     // The orchestrator is not asked again: a human already looked, so a repeat failure comes straight back to you.
     this.store.updateTask(this.key, taskId, { status: "pending", attempts: 0, note: null });
     this.mark(taskId, { done: false });
     this.say({ type: "task", taskId, status: "pending", note: "resumed by you" });
+    this.wakeUp();
+  }
+
+  /** The human decided a paused or pending task is not needed: count it as done (no commit) so dependents can run. */
+  skipTask(taskId: string): void {
+    const row = this.store.task(this.key, taskId);
+    if (row?.status === "running") throw new Error(`${taskId} is running; stop the plan first`);
+    if (row?.status === "done") return;
+    this.store.updateTask(this.key, taskId, { status: "done", summary: "Skipped by you.", note: null });
+    this.mark(taskId, { done: true });
+    this.say({ type: "task", taskId, status: "done", note: "skipped by you" });
     this.wakeUp();
   }
 
@@ -780,11 +841,11 @@ export class PlanRunner extends EventEmitter {
   /** Fix review findings in the author's own lane session, then re-review. */
   private async reviewFix(agent: AgentId, tasks: PlanTask[], notes: string): Promise<void> {
     const lane = await this.lane(agent);
-    await g.syncLane(lane.path, this.planBranch);
+    await this.syncLaneDeps(lane);
     const synthetic: PlanTask = {
       id: `review-${agent}`, title: "Review fixes", role: "implement", dependsOn: [], goal: notes, doneWhen: ["every review note is addressed"],
       checks: [...new Set(tasks.flatMap((t) => t.checks))], writeScope: [...new Set(tasks.flatMap((t) => t.writeScope))],
-      readFirst: [], skills: [], images: false, done: false, line: -1,
+      readFirst: [], skills: [], images: false, deps: [...new Set(tasks.flatMap((t) => t.deps))], done: false, line: -1,
     };
     const ref = this.candidates(tasks[0]).find((c) => c.agent === agent) ?? { agent };
     const r = await this.turn(ref, { cwd: lane.path, prompt: renderFixPrompt(synthetic, "the reviewer requested changes", notes, agent === "opencode"),
@@ -798,7 +859,7 @@ export class PlanRunner extends EventEmitter {
     const sha = await g.commitAll(lane.path, `Review fixes (${agent})`, agent);
     if (!sha) return this.blockReview(agent, `${agent} made no changes for the review findings`);
     const merged = await this.serialMerge(() => this.mergeLane(synthetic, lane));
-    await g.syncLane(lane.path, this.planBranch);
+    await this.syncLaneDeps(lane);
     if (merged !== true) return this.blockReview(agent, `review fixes did not merge: ${merged.reason}`);
     this.fixCommits.set(agent, [...(this.fixCommits.get(agent) ?? []), sha]);
   }

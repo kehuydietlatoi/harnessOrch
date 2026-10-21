@@ -197,6 +197,13 @@ handle("plan:resume", async (file: string, taskId: string, guidance: string | nu
   if (!r.running) void r.run();
   return true;
 });
+handle("plan:skip", async (file: string, taskId: string) => {
+  const r = runnerFor(file);
+  await r.prepare();
+  r.skipTask(taskId);
+  if (!r.running) void r.run();
+  return true;
+});
 handle("plan:review", async (file: string, agent: string, action: "approve" | "retry") => {
   const r = runnerFor(file);
   await r.prepare();

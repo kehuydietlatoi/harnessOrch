@@ -52,7 +52,8 @@ skills: []            # optional project skills
 
 ## 3. Rules that keep the run cheap and safe
 - **Size**: a task is 15-60 minutes of agent work with one clear outcome. Prefer 5-15 tasks.
-- **write_scope is required** and should be as narrow as possible; tasks that can run in parallel must not share files. Never include the plan file, AGENTS.md, CLAUDE.md, package manifests or lockfiles unless that task's whole point is changing them.
+- **write_scope is required** and should be as narrow as possible; tasks that can run in parallel must not share files. Never include the plan file, AGENTS.md or CLAUDE.md. Package manifests and lockfiles are always writable.
+- **Dependencies**: agents add dev dependencies (test tools, build tools) themselves, no listing needed. A task that must add a *production* dependency lists it: \`deps: ["three-stdlib"]\`; anything unlisted is reverted.
 - **read_first** points at the exact files and line ranges a worker needs, so it does not explore. Never paste code into the plan.
 - **checks** are shell commands the engine runs itself; every task needs at least one, or rely on the plan-level checks.
 - **depends_on** only when a task truly needs another's result.

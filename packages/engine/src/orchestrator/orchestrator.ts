@@ -59,8 +59,9 @@ export function renderDecisionPrompt(d: Digest, fencedResult: boolean): string {
     "## Options\n- retry: same agent, with your concrete guidance (only if you see a clear fix)\n" +
       `- reassign: another agent (${d.availableAgents.join(", ")}) with guidance (when this agent is the problem)\n` +
       "- human: the task needs a decision only a person can make (requirements, credentials, product choice)",
-    "Workers cannot install packages, change the environment or tooling, or edit outside their write scope, and neither can a retry. " +
-      "If the blocker is one of those (a missing dependency or tool, network, credentials, or a file outside the scope), choose human.",
+    "Workers may add development dependencies themselves (npm install -D ...); tell them to when a missing dev library or tool is the blocker. " +
+      "They cannot add production dependencies, change system tooling, use credentials, or edit outside their write scope, and neither can a retry: " +
+      "if the blocker is one of those, choose human.",
     "You may read files in the repository to understand the problem, but do not edit anything.",
     fencedResult ? 'End with one fenced ```json block: {"action": "...", "agent": "", "guidance": "..."}' : "End with the structured decision.",
   ].filter(Boolean).join("\n\n");

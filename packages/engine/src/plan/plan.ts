@@ -27,6 +27,8 @@ export interface PlanTask {
   skills: string[];
   /** Codex asset tasks keep image generation enabled. */
   images: boolean;
+  /** Production dependencies this task may add (dev dependencies need no listing). */
+  deps: string[];
   done: boolean;
   /** 0-based line of the task's checkbox heading. */
   line: number;
@@ -148,6 +150,7 @@ export function parsePlan(markdown: string): ParseResult {
       readFirst: strings(fields.read_first, "read_first", errors, where),
       skills: strings(fields.skills, "skills", errors, where),
       images: fields.images === true,
+      deps: strings(fields.deps, "deps", errors, where),
       done: m[2].toLowerCase() === "x",
       line,
     });

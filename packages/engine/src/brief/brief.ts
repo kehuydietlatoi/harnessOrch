@@ -54,7 +54,8 @@ const RULES = [
   "Work only inside the write scope. Do not edit the plan file, AGENTS.md or CLAUDE.md.",
   "Read the listed files (and line ranges) first; search with grep/glob instead of reading whole directories.",
   "Run checks only through the hverify command below; it prints just the failures.",
-  "Do not commit, push, or install/update packages: dependencies are already provided. The engine commits and merges your work.",
+  "Do not commit or push; the engine commits and merges your work.",
+  "Dependencies are already installed. If the task needs a new library or tool for development or tests, add it yourself as a dev dependency (e.g. `npm install -D <pkg>`). Never add production dependencies or upgrade, remove or reinstall existing packages: the engine reverts that.",
   "Stay inside your working directory. Never change other folders, other worktrees or node_modules.",
   "If something outside your scope blocks you, stop and report status \"blocked\" with your questions.",
 ];

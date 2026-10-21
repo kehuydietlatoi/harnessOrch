@@ -41,7 +41,9 @@ export function TaskPanel(props: {
         <button className="ghost icon" onClick={props.onClose} title="Close (Esc)">×</button>
       </header>
 
-      {t.status === "paused" && <ResumeBox task={t} onResume={(guidance, agent) => call(api.call("plan:resume", props.planFile, t.id, guidance, agent))} />}
+      {t.status === "paused" && <ResumeBox task={t}
+        onResume={(guidance, agent) => call(api.call("plan:resume", props.planFile, t.id, guidance, agent))}
+        onSkip={() => call(api.call("plan:skip", props.planFile, t.id))} />}
 
       <nav className="panel-tabs">
         {(["overview", "activity", "diff", "tokens"] as Tab[]).map((x) => (
@@ -101,20 +103,27 @@ export function TaskPanel(props: {
   );
 }
 
-function ResumeBox(props: { task: TaskView; onResume: (guidance: string | null, agent: string | null) => void }) {
+function ResumeBox(props: { task: TaskView; onResume: (guidance: string | null, agent: string | null) => void; onSkip: () => void }) {
   const [guidance, setGuidance] = useState("");
   const [agent, setAgent] = useState("");
+  // A blocked agent asked something: resuming without an answer would only buy the same question again.
+  const asking = props.task.note?.startsWith("the agent is blocked") ?? false;
+  const canResume = !asking || guidance.trim().length > 0 || agent !== "";
   return (
     <div className="resume-box">
-      <div className="resume-title">⏸ This task needs you</div>
-      {props.task.note && <p className="note">{props.task.note}</p>}
-      <textarea placeholder="Your answer or guidance for the agent (optional)" value={guidance} onChange={(e) => setGuidance(e.target.value)} />
+      <div className="resume-title">⏸ {asking ? "The agent asks" : "This task needs you"}</div>
+      {props.task.note && <p className="note">{asking ? props.task.note.replace(/^the agent is blocked:\s*/, "") : props.task.note}</p>}
+      <textarea placeholder={asking ? "Your answer (required to resume on the same agent)" : "Guidance for the agent (optional)"}
+        value={guidance} onChange={(e) => setGuidance(e.target.value)} />
       <div className="row">
+        <button className="ghost small" title="Count this task as done without changes so dependent tasks can run" onClick={props.onSkip}>Skip task</button>
+        <div className="spacer" />
         <select value={agent} onChange={(e) => setAgent(e.target.value)} title="Run it on">
           <option value="">same agent (keeps its work)</option>
           {AGENTS.filter((a) => a !== props.task.assigned).map((a) => <option key={a} value={a}>{a} (starts fresh)</option>)}
         </select>
-        <button className="primary" onClick={() => props.onResume(guidance || null, agent || null)}>Resume</button>
+        <button className="primary" disabled={!canResume} title={canResume ? "" : "Answer the agent's question first"}
+          onClick={() => props.onResume(guidance || null, agent || null)}>Resume</button>
       </div>
     </div>
   );
