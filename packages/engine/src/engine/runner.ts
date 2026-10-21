@@ -39,7 +39,7 @@ export interface RunnerOptions {
 
 export type RunnerEvent =
   | { type: "line"; agent: string; taskId: string | null; line: string }
-  | { type: "task"; taskId: string; status: string; agent?: string; note?: string }
+  | { type: "task"; taskId: string; status: string; agent?: string; note?: string; details?: string }
   | { type: "plan"; status: PlanStatus; message?: string }
   | { type: "needs-you"; taskId?: string; message: string }
   | { type: "run"; agent: string; taskId: string | null; phase: RunPhase; outcome: string; effective: number }
@@ -52,6 +52,9 @@ export function planKey(repo: string, planFile: string): string {
   return `${resolve(repo).replaceAll("\\", "/").toLowerCase()}#${basename(planFile).replace(/\.md$/i, "")}`;
 }
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Failure details kept on events for the task panel: enough to read, small enough for the store. */
+const clipDetails = (s: string): string => (s.length > 4000 ? `${s.slice(0, 4000)}\n… (truncated)` : s);
 
 /** Why a finished task could not be accepted yet. `notMerged`: its commit never reached the plan branch. */
 interface MergeFailure {
@@ -246,8 +249,37 @@ export class PlanRunner extends EventEmitter {
     return status;
   }
 
+  /** What each busy agent is doing: a task id, or "review" while its work is reviewed and fixed. */
+  private readonly doing = new Map<string, string>();
+
+  /** Live per-agent state for the status strip. */
+  agentStates(): Array<{ agent: AgentId; state: "working" | "idle" | "limited" | "held"; task?: string; until?: string }> {
+    const now = this.deps.now().getTime();
+    return AGENTS.map((agent) => {
+      const until = this.unavailableUntil.get(agent);
+      if (this.held.has(agent)) return { agent, state: "held" as const };
+      if (this.busy.has(agent)) return { agent, state: "working" as const, task: this.doing.get(agent) };
+      if (until && until > now) return { agent, state: "limited" as const, until: new Date(until).toISOString() };
+      return { agent, state: "idle" as const };
+    });
+  }
+
+  /** The patches of a task's commits on the plan branch (empty before its first merge). */
+  async taskDiff(taskId: string): Promise<string> {
+    let commits = this.commitsOf(taskId);
+    if (!commits.length) {
+      // Older runs did not record every commit: find the task's own commits by their subject line.
+      const t = this.plan?.tasks.find((x) => x.id === taskId) ?? this.load().plan.tasks.find((x) => x.id === taskId);
+      if (!t) return "";
+      const log = await g.tryGit(this.repo, ["log", "--all", "--reverse", "--format=%H%x09%s", "--fixed-strings", `--grep=${t.id}: ${t.title}`]);
+      commits = log.stdout.split(/\r?\n/).map((l) => l.split("\t")).filter(([, s]) => s === `${t.id}: ${t.title}`).map(([h]) => h);
+    }
+    return commits.length ? (await g.commitsDiff(this.repo, commits)).diff : "";
+  }
+
   private track(agent: string, key: string, work: Promise<void>): void {
     this.busy.add(agent);
+    this.doing.set(agent, key.startsWith("task:") ? key.slice(5) : "review");
     const p = work.catch((error: unknown) => {
       this.say({ type: "info", message: `${key} crashed: ${error instanceof Error ? error.message : String(error)}` });
       const taskId = key.startsWith("task:") ? key.slice(5) : null;
@@ -255,6 +287,7 @@ export class PlanRunner extends EventEmitter {
     }).finally(() => {
       this.inflight.delete(key);
       this.busy.delete(agent);
+      this.doing.delete(agent);
     });
     this.inflight.set(key, p);
   }
@@ -442,7 +475,7 @@ export class PlanRunner extends EventEmitter {
       attempts++;
       this.store.updateTask(this.key, t.id, { attempts });
       if (attempts >= this.cfg.maxAttempts) return this.escalate(t, lane, failure.reason, failure.details, attempts, history);
-      this.say({ type: "task", taskId: t.id, status: "running", agent, note: `attempt ${attempts + 1}: ${failure.reason}` });
+      this.say({ type: "task", taskId: t.id, status: "running", agent, note: `attempt ${attempts + 1}: ${failure.reason}`, details: clipDetails(failure.details) });
       prompt = renderFixPrompt(t, failure.reason, failure.details, fenced);
     }
   }
@@ -583,7 +616,7 @@ export class PlanRunner extends EventEmitter {
       if (decision) details = `${decision.guidance}\n\n${details}`;
     }
     await this.park(t, lane);
-    this.pause(t.id, `${reason}: ${details.split("\n")[0].slice(0, 200)}`);
+    this.pause(t.id, `${reason}: ${details.split("\n")[0].slice(0, 200)}`, details);
   }
 
   /** Tasks the orchestrator sent back to the same agent: resume in place, keep the work tree. */
@@ -601,10 +634,10 @@ export class PlanRunner extends EventEmitter {
     return null;
   }
 
-  private pause(taskId: string, note: string): void {
+  private pause(taskId: string, note: string, details?: string): void {
     this.store.updateTask(this.key, taskId, { status: "paused", note });
     this.mark(taskId, { done: false, note: `⏸ needs you: ${note.slice(0, 120)}` });
-    this.say({ type: "task", taskId, status: "paused", note });
+    this.say({ type: "task", taskId, status: "paused", note, ...(details ? { details: clipDetails(details) } : {}) });
     this.say({ type: "needs-you", taskId, message: `${taskId} paused: ${note}` });
   }
 
@@ -808,16 +841,21 @@ export class PlanRunner extends EventEmitter {
   }
 
   /** Snapshot for the board. */
-  snapshot(): { id: string; title: string; status: PlanStatus | undefined; tasks: Array<PlanTask & { status: string; assigned: string | null; note: string | null; attempts: number }>; effective: Record<string, number> } {
+  snapshot() {
     const rows = new Map(this.store.tasks(this.key).map((r) => [r.id, r]));
+    const runs = this.store.runs(this.key);
     const effective: Record<string, number> = {};
-    for (const run of this.store.runs(this.key)) effective[run.agent] = (effective[run.agent] ?? 0) + run.effective;
+    for (const run of runs) effective[run.agent] = (effective[run.agent] ?? 0) + run.effective;
     return {
       id: this.id, title: this.plan?.header.title ?? this.id, status: this.store.plan(this.key)?.status,
+      checks: this.plan?.header.checks ?? [], skills: this.plan?.header.skills ?? [], baseBranch: this.baseBranch || null,
       tasks: (this.plan?.tasks ?? []).map((t) => {
         const r = rows.get(t.id);
-        return { ...t, status: r?.status ?? "pending", assigned: r?.agent ?? this.candidates(t)[0]?.agent ?? null, note: r?.note ?? null, attempts: r?.attempts ?? 0 };
+        return { ...t, status: r?.status ?? (t.done ? "done" : "pending"), assigned: r?.agent ?? this.candidates(t)[0]?.agent ?? null,
+          note: r?.note ?? null, attempts: r?.attempts ?? 0, summary: r?.summary ?? null, decisions: r?.decisions ?? [], commits: this.commitsOf(t.id) };
       }),
+      runs,
+      agentStates: this.agentStates(),
       effective,
     };
   }

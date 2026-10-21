@@ -39,5 +39,5 @@ export function Term(props: {
 
   useEffect(() => { if (props.visible) requestAnimationFrame(() => fit.current?.fit()); }, [props.visible]);
 
-  return <div ref={host} className="term" style={{ display: props.visible ? "block" : "none" }} />;
+  return <div ref={host} className="term" style={{ visibility: props.visible ? "visible" : "hidden" }} />;
 }

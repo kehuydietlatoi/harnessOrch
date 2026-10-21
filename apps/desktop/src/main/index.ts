@@ -79,14 +79,16 @@ function snapshot(file: string) {
   const r = runnerFor(file);
   const { errors, warnings } = r.load();
   const snap = r.snapshot();
-  const runs = store.runs(r.key);
   const agents = AGENT_IDS.map((agent) => {
-    const rs = runs.filter((x) => x.agent === agent);
+    const rs = snap.runs.filter((x) => x.agent === agent);
     const sum = rs.reduce((u, x) => ({ input: u.input + x.usage.input, cacheRead: u.cacheRead + x.usage.cacheRead, cacheWrite: u.cacheWrite + x.usage.cacheWrite }), { input: 0, cacheRead: 0, cacheWrite: 0 });
-    return { agent, runs: rs.length, effective: rs.reduce((n, x) => n + x.effective, 0), cacheHit: cacheHitRate(sum), active: r.activeAgents.includes(agent) };
+    const state = snap.agentStates.find((s) => s.agent === agent);
+    return { agent, runs: rs.length, effective: rs.reduce((n, x) => n + x.effective, 0), cacheHit: cacheHitRate(sum),
+      active: state?.state === "working", state: state?.state ?? "idle", task: state?.task ?? null, until: state?.until ?? null };
   });
-  const reviews = store.reviews(r.key);
-  return { ...snap, errors, warnings, agents, reviews, running: r.running, events: store.events(r.key).slice(-200) };
+  const events = store.events(r.key);
+  return { ...snap, errors, warnings, agents, reviews: store.reviews(r.key), running: r.running,
+    startedAt: events.find((e) => e.type === "plan")?.ts ?? null, events: events.slice(-300) };
 }
 
 // ---- terminals ----------------------------------------------------------------
@@ -208,6 +210,11 @@ handle("plan:merge", async (file: string) => {
   return r.mergeToBase();
 });
 handle("plan:open", (file: string) => shell.openPath(file));
+handle("plan:taskDiff", async (file: string, taskId: string) => {
+  // Commits live in the shared object store: no need to (re)create worktrees just to read a diff.
+  return runnerFor(file).taskDiff(taskId);
+});
+handle("log:open", (path: string) => shell.openPath(path));
 handle("pty:planner", (cols: number, rows: number) => spawnPlanner(cols, rows));
 handle("pty:takeover", (file: string, agent: AgentId, cols: number, rows: number) => spawnTakeover(file, agent, cols, rows));
 handle("pty:write", (id: string, data: string) => { terms.get(id)?.proc.write(data); return true; });
@@ -228,7 +235,7 @@ function createWindow(): void {
   });
   win.webContents.on("preload-error", (_e, path, error) => console.error(`[preload] ${path}: ${error.message}`));
   if (process.env.ELECTRON_RENDERER_URL) void win.loadURL(process.env.ELECTRON_RENDERER_URL);
-  else void win.loadFile(join(here, "../renderer/index.html"));
+  else void win.loadFile(join(here, "../renderer/index.html"), process.env.HARNESS_UI_HASH ? { hash: process.env.HARNESS_UI_HASH } : undefined);
   // Dev hook: HARNESS_AUTOSTART=<plan.md> starts that plan as soon as the window has loaded.
   const autostart = process.env.HARNESS_AUTOSTART;
   if (autostart) win.webContents.once("did-finish-load", () => void runnerFor(autostart).run());
