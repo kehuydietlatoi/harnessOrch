@@ -221,6 +221,35 @@ describe("plan runner", { timeout: 90_000 }, () => {
     expect(calls.filter((c) => c.prompt.includes("# Task T1")).map((c) => c.agent)).toEqual(["opencode", "codex"]);
   });
 
+  it("'Review again' after a failed fix redoes the fix first, then reviews once more", async () => {
+    const plan = writePlan(task("T1", "Stubborn", `agent: codex
+goal: g
+write_scope: [src/T1.txt]`));
+    let reviews = 0;
+    let fixes = 0;
+    const { runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) {
+        reviews++;
+        return reviews === 1 ? { structured: { decision: "request-changes", notes: "add the missing part", followups: [] } } : approve;
+      }
+      if (req.prompt.includes("reviewer requested changes")) {
+        fixes++;
+        // The first fix dies (like the wrongly killed turn); the human's retry must redo it, not just re-review.
+        if (fixes === 1) return { code: 1, aborted: "killed", structured: undefined };
+        return { ...done(), write: { "src/T1.txt": "fixed" } };
+      }
+      return { ...done(), write: { "src/T1.txt": "x" } };
+    });
+    const r = runner(plan, runTurn);
+    expect(await r.run()).toBe("paused");
+    expect([reviews, fixes]).toEqual([1, 1]);
+    r.resolveReview("codex", "retry");
+    expect(await r.run()).toBe("ready");
+    expect([reviews, fixes]).toEqual([2, 2]);
+    expect(store.reviews(KEY(), "codex").map((v) => v.decision)).toEqual(["request-changes", "approve"]);
+    expect(sh(repo, "show", "harness/demo:src/T1.txt")).toBe("fixed");
+  });
+
   it("runs one review fix round in the author's session, then re-reviews", async () => {
     const plan = writePlan(task("T1", "Reviewed", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
     let reviews = 0;

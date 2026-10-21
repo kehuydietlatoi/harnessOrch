@@ -763,8 +763,13 @@ export class PlanRunner extends EventEmitter {
     const last = this.store.reviews(this.key, agent).at(-1);
     if (!last) return "pending";
     if (last.decision === "approve") return "approved";
-    return last.round >= this.cfg.maxReviewRounds ? "exhausted" : "rejected";
+    return last.round >= this.cfg.maxReviewRounds + (this.extraRounds.get(agent) ?? 0) ? "exhausted" : "rejected";
   }
+
+  /** Review rounds granted by "Review again", on top of maxReviewRounds. */
+  private readonly extraRounds = new Map<string, number>();
+  /** Authors whose next review must first fix the last round's findings (their fix never landed). */
+  private readonly fixFirst = new Set<string>();
 
   private startReviews(): void {
     for (const agent of this.authors()) {
@@ -807,6 +812,10 @@ export class PlanRunner extends EventEmitter {
     if (action === "approve") {
       const round = (this.store.reviews(this.key, agent).at(-1)?.round ?? 0) + 1;
       this.store.addReview({ planId: this.key, agent, round, reviewer: "human", decision: "approve", notes: "approved by you" });
+    } else {
+      // One more fix-and-review cycle: the author addresses the last findings, then a fresh review runs.
+      this.extraRounds.set(agent, (this.extraRounds.get(agent) ?? 0) + 1);
+      if (this.store.reviews(this.key, agent).at(-1)?.decision === "request-changes") this.fixFirst.add(agent);
     }
     this.wakeUp();
   }
@@ -825,6 +834,13 @@ export class PlanRunner extends EventEmitter {
     const round = (this.store.reviews(this.key, author).at(-1)?.round ?? 0) + 1;
     const rows = this.store.tasks(this.key).filter((r) => r.agent === author && r.status === "done" && r.commitSha);
     const tasks = rows.map((r) => this.task(r.id));
+    if (this.fixFirst.delete(author)) {
+      const last = this.store.reviews(this.key, author).at(-1);
+      if (last && last.decision === "request-changes" && tasks.length) {
+        await this.reviewFix(author as AgentId, tasks, last.notes);
+        if (this.reviewBlocked.has(author)) return;
+      }
+    }
     const reviewer = this.reviewerFor(author);
     if (!reviewer) return;
     const { diff } = await g.commitsDiff(this.planWorktree, rows.flatMap((r) => this.commitsOf(r.id)).concat(this.fixCommits.get(author) ?? []));
