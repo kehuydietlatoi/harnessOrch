@@ -11,7 +11,32 @@ export const AGENTS: Agent[] = ["codex", "claude", "opencode"];
 
 export interface PlanListItem { file: string; title: string; tasks: number; done: number; errors: number; status: string | null }
 
-export type TaskStatus = "pending" | "running" | "done" | "paused";
+/** The engine's task lifecycle states (packages/engine/src/engine/lifecycle.ts). */
+export type TaskStatus = "queued" | "working" | "checking" | "merging" | "escalating" | "waiting" | "stopped" | "interrupted" | "done" | "skipped";
+export const IN_FLIGHT: TaskStatus[] = ["working", "checking", "merging", "escalating"];
+export const NEEDS_YOU: TaskStatus[] = ["waiting", "stopped", "interrupted"];
+export const FINAL: TaskStatus[] = ["done", "skipped"];
+export const STOPPABLE: TaskStatus[] = ["working", "checking", "merging"];
+/** Board group of a state; also its CSS tone. */
+export const groupOf = (s: TaskStatus): "queued" | "running" | "needs-you" | "done" =>
+  IN_FLIGHT.includes(s) ? "running" : NEEDS_YOU.includes(s) ? "needs-you" : FINAL.includes(s) ? "done" : "queued";
+
+/** The facts the Stop confirm shows (engine StopInfo). */
+export interface StopInfo {
+  taskId: string;
+  state: TaskStatus;
+  agent: string | null;
+  stoppable: boolean;
+  deferred: boolean;
+  phaseElapsedMs: number | null;
+  turnElapsedMs: number | null;
+  tokensSoFar: number | null;
+  tokensNote: string | null;
+  uncommittedFiles: number;
+  dependents: string[];
+  ifStopped: string;
+  afterwards: string[];
+}
 
 export interface TaskView {
   id: string;
@@ -28,6 +53,9 @@ export interface TaskView {
   skills: string[];
   images: boolean;
   status: TaskStatus;
+  /** What happens next in this state. */
+  next: string;
+  phaseStartedAt: string | null;
   assigned: string | null;
   note: string | null;
   attempts: number;

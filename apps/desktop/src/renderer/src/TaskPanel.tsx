@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ActivityList } from "./Activity";
 import { DiffView } from "./Diff";
-import { AGENTS, api, fmtDuration, fmtTime, fmtTokens, prefs, type Snapshot, type TaskView } from "./api";
+import { AGENTS, api, fmtDuration, fmtTime, fmtTokens, groupOf, NEEDS_YOU, prefs, STOPPABLE, type Snapshot, type StopInfo, type TaskView } from "./api";
 
 type Tab = "overview" | "activity" | "diff" | "tokens";
 
@@ -16,7 +16,7 @@ export function TaskPanel(props: {
   onChanged: () => void;
 }) {
   const t = props.task;
-  const [tab, setTab] = useState<Tab>(() => (props.initialTab as Tab | undefined) ?? (t.status === "paused" ? "activity" : prefs.get<Tab>("panelTab", "overview")));
+  const [tab, setTab] = useState<Tab>(() => (props.initialTab as Tab | undefined) ?? (NEEDS_YOU.includes(t.status) ? "activity" : prefs.get<Tab>("panelTab", "overview")));
   const [diff, setDiff] = useState<string | null>(null);
   const commitsKey = t.commits.join(",");
 
@@ -35,15 +35,18 @@ export function TaskPanel(props: {
     <aside className="panel">
       <header className="panel-head">
         <div>
-          <div className="panel-id"><b>{t.id}</b> <span className={`badge role-${t.role}`}>{t.role}</span> <span className={`status-pill ${t.status}`}>{t.status}</span></div>
+          <div className="panel-id"><b>{t.id}</b> <span className={`badge role-${t.role}`}>{t.role}</span> <span className={`status-pill ${groupOf(t.status)} ${t.status}`}>{t.status}</span></div>
           <h2>{t.title}</h2>
         </div>
         <button className="ghost icon" onClick={props.onClose} title="Close (Esc)">×</button>
       </header>
 
-      {t.status === "paused" && <ResumeBox task={t}
+      {NEEDS_YOU.includes(t.status) && <ResumeBox key={`${t.id}:${t.status}`} task={t}
         onResume={(guidance, agent) => call(api.call("plan:resume", props.planFile, t.id, guidance, agent))}
+        onRestartClean={() => call(api.call("plan:restartClean", props.planFile, t.id))}
         onSkip={() => call(api.call("plan:skip", props.planFile, t.id))} />}
+      {STOPPABLE.includes(t.status) && <StopBox key={t.id} task={t} planFile={props.planFile}
+        onStop={() => call(api.call("plan:stopTask", props.planFile, t.id))} onError={props.onError} />}
 
       <nav className="panel-tabs">
         {(["overview", "activity", "diff", "tokens"] as Tab[]).map((x) => (
@@ -57,12 +60,12 @@ export function TaskPanel(props: {
         {tab === "overview" && (
           <div className="overview">
             <Field label="Agent">
-              <select value={t.agent ?? ""} disabled={t.status !== "pending"}
+              <select value={t.agent ?? ""} disabled={t.status !== "queued"}
                 onChange={(e) => void call(api.call("plan:setAgent", props.planFile, t.id, e.target.value || null))}>
                 <option value="">{t.assigned ? `${t.assigned} (auto)` : "auto"}</option>
                 {AGENTS.map((a) => <option key={a} value={a}>{a}</option>)}
               </select>
-              {t.status !== "pending" && <span className="muted"> locked while {t.status}</span>}
+              {t.status !== "queued" && <span className="muted"> locked while {t.status}</span>}
             </Field>
             <Field label="Goal"><p>{t.goal}</p></Field>
             {t.summary && <Field label="Result"><p>{t.summary}</p></Field>}
@@ -103,27 +106,76 @@ export function TaskPanel(props: {
   );
 }
 
-function ResumeBox(props: { task: TaskView; onResume: (guidance: string | null, agent: string | null) => void; onSkip: () => void }) {
+const NEEDS_YOU_TITLE: Record<string, string> = {
+  waiting: "This task needs you",
+  stopped: "Stopped by you",
+  interrupted: "Interrupted when the app closed",
+};
+
+function ResumeBox(props: {
+  task: TaskView;
+  onResume: (guidance: string | null, agent: string | null) => void;
+  onRestartClean: () => void;
+  onSkip: () => void;
+}) {
   const [guidance, setGuidance] = useState("");
   const [agent, setAgent] = useState("");
+  const t = props.task;
   // A blocked agent asked something: resuming without an answer would only buy the same question again.
-  const asking = props.task.note?.startsWith("the agent is blocked") ?? false;
+  const asking = t.status === "waiting" && (t.note?.startsWith("the agent is blocked") ?? false);
   const canResume = !asking || guidance.trim().length > 0 || agent !== "";
   return (
     <div className="resume-box">
-      <div className="resume-title">⏸ {asking ? "The agent asks" : "This task needs you"}</div>
-      {props.task.note && <p className="note">{asking ? props.task.note.replace(/^the agent is blocked:\s*/, "") : props.task.note}</p>}
+      <div className="resume-title">⏸ {asking ? "The agent asks" : NEEDS_YOU_TITLE[t.status]}</div>
+      {t.note && <p className="note">{asking ? t.note.replace(/^the agent is blocked:\s*/, "") : t.note}</p>}
+      <p className="muted small">{t.next}</p>
       <textarea placeholder={asking ? "Your answer (required to resume on the same agent)" : "Guidance for the agent (optional)"}
         value={guidance} onChange={(e) => setGuidance(e.target.value)} />
       <div className="row">
-        <button className="ghost small" title="Count this task as done without changes so dependent tasks can run" onClick={props.onSkip}>Skip task</button>
+        <button className="ghost small" title="Count this task as finished without changes so dependent tasks can run" onClick={props.onSkip}>Skip task</button>
+        <button className="ghost small" title="Drop its parked edits and start over from a fresh brief" onClick={props.onRestartClean}>Restart clean</button>
         <div className="spacer" />
         <select value={agent} onChange={(e) => setAgent(e.target.value)} title="Run it on">
           <option value="">same agent (keeps its work)</option>
-          {AGENTS.filter((a) => a !== props.task.assigned).map((a) => <option key={a} value={a}>{a} (starts fresh)</option>)}
+          {AGENTS.filter((a) => a !== t.assigned).map((a) => <option key={a} value={a}>{a} (starts fresh)</option>)}
         </select>
-        <button className="primary" disabled={!canResume} title={canResume ? "" : "Answer the agent's question first"}
+        <button className="primary" disabled={!canResume} title={canResume ? "Restore its edits and continue in the same session" : "Answer the agent's question first"}
           onClick={() => props.onResume(guidance || null, agent || null)}>Resume</button>
+      </div>
+    </div>
+  );
+}
+
+/** Stop opens an inline confirm with the facts: what gets killed, what it has cost so far, what waits, what you can do after. */
+function StopBox(props: { task: TaskView; planFile: string; onStop: () => void; onError: (e: string) => void }) {
+  const [info, setInfo] = useState<StopInfo | null>(null);
+  const open = (): void => {
+    api.call<StopInfo>("plan:stopInfo", props.planFile, props.task.id).then(setInfo, (e: Error) => props.onError(e.message));
+  };
+  if (!info) {
+    return (
+      <div className="stop-row">
+        <span className="muted small">{props.task.next}</span>
+        <button className="danger small" onClick={open}>■ Stop</button>
+      </div>
+    );
+  }
+  const kills = info.state === "checking" ? "the running check" : `${info.agent ?? "the agent"}'s turn`;
+  return (
+    <div className="confirm-box">
+      <div className="confirm-title">Stop {info.taskId}?</div>
+      <ul className="plain facts">
+        <li>{info.deferred ? <>A merge is running. The stop waits for it to finish, so git is never left half-merged.</> : <>Kills {kills} now{info.turnElapsedMs !== null ? <>, running for {fmtDuration(info.turnElapsedMs)}</> : null}.</>}</li>
+        {info.state === "working" && <li>Tokens so far: {info.tokensSoFar !== null ? fmtTokens(info.tokensSoFar) : info.tokensNote ?? "not reported yet"}</li>}
+        <li>{info.uncommittedFiles ? `${info.uncommittedFiles} uncommitted file${info.uncommittedFiles === 1 ? "" : "s"} get parked on the stash.` : "No uncommitted files to park."}</li>
+        <li>{info.dependents.length ? `Waits while stopped: ${info.dependents.join(", ")}.` : "No other task waits on it."}</li>
+        <li>Afterwards: {info.afterwards.join(" · ")}.</li>
+      </ul>
+      <p className="muted small">{info.ifStopped}</p>
+      <div className="row">
+        <div className="spacer" />
+        <button className="ghost small" onClick={() => setInfo(null)}>Keep running</button>
+        <button className="danger small" disabled={!info.stoppable} onClick={() => { setInfo(null); props.onStop(); }}>Stop task</button>
       </div>
     </div>
   );

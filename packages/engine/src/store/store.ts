@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ThreadTotals, TurnUsage } from "../agents/turn.js";
-import type { TaskStatus } from "../scheduler/scheduler.js";
+import { LEGACY_STATES, type TaskState } from "../engine/lifecycle.js";
 
 export type PlanStatus = "running" | "paused" | "reviewing" | "ready" | "merged" | "stopped";
 export type RunPhase = "implement" | "fix" | "review" | "orchestrate" | "conflict";
@@ -20,7 +20,7 @@ export interface PlanRow {
 export interface TaskRow {
   planId: string;
   id: string;
-  status: TaskStatus;
+  status: TaskState;
   agent: string | null;
   model: string | null;
   attempts: number;
@@ -30,6 +30,10 @@ export interface TaskRow {
   commitSha: string | null;
   /** Set once the orchestrator has intervened, so it is asked at most once per task. */
   orchestrated: boolean;
+  /** When the task entered its current state. */
+  phaseStartedAt: string | null;
+  /** When its latest agent turn started. */
+  turnStartedAt: string | null;
 }
 
 export interface SessionRow {
@@ -111,6 +115,13 @@ export class Store {
     this.db.exec(SCHEMA);
     const sessionColumns = this.db.prepare("PRAGMA table_info(sessions)").all() as Row[];
     if (!sessionColumns.some((c) => c.name === "thread_totals")) this.db.exec("ALTER TABLE sessions ADD COLUMN thread_totals TEXT");
+    const taskColumns = this.db.prepare("PRAGMA table_info(tasks)").all() as Row[];
+    for (const col of ["phase_started_at", "turn_started_at"]) {
+      if (!taskColumns.some((c) => c.name === col)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${col} TEXT`);
+    }
+    // Statuses from before the task lifecycle. A row left "running" belonged to a process that is gone.
+    const legacy = this.db.prepare("UPDATE tasks SET status = ? WHERE status = ?");
+    for (const [from, to] of Object.entries(LEGACY_STATES)) legacy.run(to, from);
   }
 
   close(): void { this.db.close(); }
@@ -145,14 +156,15 @@ export class Store {
   /** Insert tasks that are new; existing rows keep their run state. */
   syncTasks(planId: string, tasks: readonly { id: string; done: boolean }[]): void {
     const stmt = this.db.prepare("INSERT OR IGNORE INTO tasks (plan_id, id, status) VALUES (?, ?, ?)");
-    for (const t of tasks) stmt.run(planId, t.id, t.done ? "done" : "pending");
+    for (const t of tasks) stmt.run(planId, t.id, t.done ? "done" : "queued");
   }
 
   tasks(planId: string): TaskRow[] {
     return (this.db.prepare("SELECT * FROM tasks WHERE plan_id = ?").all(planId) as Row[]).map((r) => ({
-      planId, id: r.id as string, status: r.status as TaskStatus, agent: str(r.agent), model: str(r.model),
+      planId, id: r.id as string, status: r.status as TaskState, agent: str(r.agent), model: str(r.model),
       attempts: Number(r.attempts), note: str(r.note), summary: str(r.summary),
       decisions: JSON.parse((r.decisions as string) || "[]") as string[], commitSha: str(r.commit_sha), orchestrated: Number(r.orchestrated) === 1,
+      phaseStartedAt: str(r.phase_started_at), turnStartedAt: str(r.turn_started_at),
     }));
   }
 
@@ -165,6 +177,7 @@ export class Store {
       status: ["status", (v) => v], agent: ["agent", (v) => v], model: ["model", (v) => v], attempts: ["attempts", (v) => v],
       note: ["note", (v) => v], summary: ["summary", (v) => v], decisions: ["decisions", (v) => JSON.stringify(v ?? [])],
       commitSha: ["commit_sha", (v) => v], orchestrated: ["orchestrated", (v) => (v ? 1 : 0)],
+      phaseStartedAt: ["phase_started_at", (v) => v], turnStartedAt: ["turn_started_at", (v) => v],
     };
     const set = (Object.keys(patch) as (keyof typeof patch)[]).filter((k) => patch[k] !== undefined && k in encode);
     if (!set.length) return;

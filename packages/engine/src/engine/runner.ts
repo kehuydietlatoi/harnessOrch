@@ -6,21 +6,22 @@ import { runTurn as defaultRunTurn, type AgentId, type TurnRequest, type TurnRes
 import { parseWorkerResult, renderBrief, renderFixPrompt, renderHandoff, RESULT_SCHEMA, type WorkerResult } from "../brief/brief.js";
 import { changedPaths, checksPassed, formatCheckFailures, runChecks as defaultRunChecks, scopeViolations, type CheckResult } from "../checks/checks.js";
 import { lockPathsOverlap } from "../git/path-locks.js";
-import { budgetWatcher, effectiveTokens } from "../ledger/effective.js";
+import { budgetWatcher, effectiveTokens, type BudgetWatcher } from "../ledger/effective.js";
 import { orchHome, projectId } from "../ledger/telemetry.js";
 import { DECISION_SCHEMA, parseDecision, renderConflictPrompt, renderDecisionPrompt, type Decision } from "../orchestrator/orchestrator.js";
 import { markTask, parsePlan, validatePlan, type Plan, type PlanTask, type TaskMark } from "../plan/plan.js";
 import { parseVerdict, renderReviewPrompt, VERDICT_SCHEMA } from "../review/review.js";
 import { blockedBy, nextDispatches, planFinished, type SchedTask } from "../scheduler/scheduler.js";
 import { listSkills, selectSkills, type Skill, type SkillRole } from "../skills/skills.js";
-import type { PlanStatus, RunPhase, Store } from "../store/store.js";
+import type { PlanStatus, RunPhase, Store, TaskRow } from "../store/store.js";
 import * as g from "./git.js";
 import { dependencyViolations, installDeps, isManifest, MANIFEST_GLOBS, staleDeps } from "./deps.js";
 import { prepareWorktreeRemoval } from "../git/worktree.js";
+import { canTransition, FINAL, IN_FLIGHT, NEEDS_YOU, STATE_INFO, STOPPABLE, transition, type TaskEvent, type TaskState } from "./lifecycle.js";
 
 export interface RunnerDeps {
   runTurn: (req: TurnRequest) => Promise<TurnResult>;
-  runChecks: (commands: readonly string[], cwd: string, logDir: string, timeoutMs?: number) => Promise<CheckResult[]>;
+  runChecks: (commands: readonly string[], cwd: string, logDir: string, timeoutMs?: number, signal?: AbortSignal) => Promise<CheckResult[]>;
   now: () => Date;
   sleep: (ms: number) => Promise<void>;
   installDeps: (cwd: string) => Promise<{ ok: boolean; output: string }>;
@@ -65,6 +66,29 @@ interface MergeFailure {
   notMerged?: true;
 }
 
+/** The facts the Stop confirm shows before you stop a task. */
+export interface StopInfo {
+  taskId: string;
+  state: TaskState;
+  agent: string | null;
+  /** Stop applies here right now (a task with work in flight). */
+  stoppable: boolean;
+  /** A merge is running: the stop takes effect once it finishes. */
+  deferred: boolean;
+  phaseElapsedMs: number | null;
+  turnElapsedMs: number | null;
+  /** Effective tokens of the running turn; null when the agent only reports them at the end (Codex). */
+  tokensSoFar: number | null;
+  tokensNote: string | null;
+  uncommittedFiles: number;
+  /** Unfinished tasks that depend on this one, directly or not; they wait while it is stopped. */
+  dependents: string[];
+  ifStopped: string;
+  afterwards: string[];
+}
+
+type TaskPatch = Partial<Omit<TaskRow, "planId" | "id" | "status">>;
+
 interface Lane {
   agent: AgentId;
   path: string;
@@ -103,6 +127,10 @@ export class PlanRunner extends EventEmitter {
   /** Agents whose session must restart with a handoff (rotation, reassignment). */
   private readonly rotate = new Set<string>();
   private mergeChain: Promise<unknown> = Promise.resolve();
+  /** One per task with work in flight: Stop aborts it. */
+  private readonly controllers = new Map<string, AbortController>();
+  /** The live budget watcher of each task's running turn, for tokens-so-far. */
+  private readonly watchers = new Map<string, BudgetWatcher>();
 
   constructor(opts: RunnerOptions) {
     super();
@@ -157,8 +185,38 @@ export class PlanRunner extends EventEmitter {
     this.store.upsertPlan({ id: this.key, repo: this.repo, file: this.planRel, baseBranch: this.baseBranch, planBranch: this.planBranch,
       status: existing?.status === "merged" ? "merged" : "paused" });
     this.store.syncTasks(this.key, this.plan.tasks);
-    // A previous app session that died mid-run leaves rows "running"; this process has nothing in flight yet.
-    for (const t of this.store.tasks(this.key)) if (t.status === "running") this.store.updateTask(this.key, t.id, { status: "pending" });
+    // A previous app session that died mid-run leaves tasks in flight; this process has nothing in flight yet.
+    // Rows migrated from before the lifecycle arrive as "interrupted" with no note.
+    for (const row of this.store.tasks(this.key)) {
+      if (IN_FLIGHT.includes(row.status) || (row.status === "interrupted" && row.note === null)) await this.recover(row);
+    }
+  }
+
+  /** A task the last app session left in flight: keep its edits, say what it was doing, and mark it interrupted. */
+  private async recover(row: TaskRow): Promise<void> {
+    const t = this.plan.tasks.find((x) => x.id === row.id);
+    if (!t) return;
+    const lanePath = row.agent ? join(this.wtRoot, row.agent) : null;
+    const lane = lanePath && existsSync(lanePath) ? lanePath : null;
+    if (row.status === "merging" && lane) {
+      const head = (await g.tryGit(lane, ["log", "-1", "--format=%H%x09%s"])).stdout.trim().split("\t");
+      if (head[1] === `${t.id}: ${t.title}` && head[0]) {
+        if (await g.isAncestor(this.repo, head[0], this.planBranch)) {
+          const commits = [...new Set([...this.commitsOf(t.id), head[0]])];
+          this.setState(t.id, "merged", { commitSha: commits.join(" "), note: null }, { note: "the merge landed before the app closed" });
+          this.mark(t.id, { done: true });
+          return;
+        }
+        // Committed but never merged: turn the commit back into edits so they can be parked and resumed.
+        await g.git(lane, ["reset", "-q", "--mixed", "HEAD~1"]);
+      }
+    }
+    const parked = lane ? await g.stashWip(lane, this.parkLabel(t)) : false;
+    const was = row.status === "interrupted" ? "running" : row.status;
+    const note = `${row.agent ?? "the agent"} was ${was} when the app closed${parked ? "; its edits are kept" : ""}`;
+    if (row.status === "interrupted") this.store.updateTask(this.key, t.id, { note });
+    // The orchestrator's turn died with the app: let it decide again next time.
+    else this.setState(t.id, "appClosed", { note, ...(row.status === "escalating" ? { orchestrated: false } : {}) }, { note });
   }
 
   stop(): void {
@@ -231,6 +289,8 @@ ${r.output}` });
   private async loop(): Promise<PlanStatus> {
     if (!this.planBranch) await this.prepare();
     this.stopped = false;
+    // Start continues tasks the app closed on, like Resume: same session, edits restored.
+    for (const row of this.store.tasks(this.key)) if (row.status === "interrupted") this.resumeTask(row.id);
     this.setStatus("running");
     while (!this.stopped) {
       this.load();
@@ -249,7 +309,7 @@ ${r.output}` });
           await Promise.race([this.deps.sleep(waitMs), this.wakeSignal()]);
           continue;
         }
-        const paused = [...this.store.tasks(this.key).filter((t) => t.status === "paused").map((t) => t.id), ...[...this.reviewBlocked].map((a) => `review of ${a}`)];
+        const paused = [...this.store.tasks(this.key).filter((t) => NEEDS_YOU.includes(t.status)).map((t) => t.id), ...[...this.reviewBlocked].map((a) => `review of ${a}`)];
         return this.setStatus("paused", paused.length ? `waiting for you on ${paused.join(", ")}` : "nothing can run");
       }
       // Wake on a finished turn, or at once when a human resumes, reassigns or hands a lane back.
@@ -308,7 +368,8 @@ ${r.output}` });
     const p = work.catch((error: unknown) => {
       this.say({ type: "info", message: `${key} crashed: ${error instanceof Error ? error.message : String(error)}` });
       const taskId = key.startsWith("task:") ? key.slice(5) : null;
-      if (taskId) this.pause(taskId, `engine error: ${error instanceof Error ? error.message : String(error)}`);
+      const state = taskId ? this.store.task(this.key, taskId)?.status : undefined;
+      if (taskId && state && canTransition(state, "error")) this.pause(taskId, "error", `engine error: ${error instanceof Error ? error.message : String(error)}`);
     }).finally(() => {
       this.inflight.delete(key);
       this.busy.delete(agent);
@@ -338,7 +399,7 @@ ${r.output}` });
     const rows = new Map(this.store.tasks(this.key).map((r) => [r.id, r]));
     return this.plan.tasks.map((t) => ({
       id: t.id, dependsOn: t.dependsOn, writeScope: t.writeScope, candidates: this.candidates(t),
-      status: rows.get(t.id)?.status ?? (t.done ? "done" : "pending"),
+      status: rows.get(t.id)?.status ?? (t.done ? "done" : "queued"),
     }));
   }
 
@@ -350,7 +411,7 @@ ${r.output}` });
   /** When pending work is blocked only by usage limits, how long until the first one lifts. */
   private waitForLimits(sched: readonly SchedTask[], unavailable: ReadonlySet<string>): number | null {
     const blocked = blockedBy(sched);
-    const waiting = sched.filter((t) => t.status === "pending" && !blocked.has(t.id) && t.candidates.every((c) => unavailable.has(c.agent)));
+    const waiting = sched.filter((t) => t.status === "queued" && !blocked.has(t.id) && t.candidates.every((c) => unavailable.has(c.agent)));
     if (!waiting.length) return null;
     const now = this.deps.now().getTime();
     const until = Math.min(...waiting.flatMap((t) => t.candidates.map((c) => this.unavailableUntil.get(c.agent) ?? now)));
@@ -401,9 +462,15 @@ ${r.output}` });
   /** One turn in an agent's plan session, with ledger, live lines and session bookkeeping. */
   private async turn(ref: AgentRef, opts: {
     cwd: string; prompt: string; taskId: string | null; phase: RunPhase; session: "lane" | "fresh";
-    schema?: object; readOnly?: boolean; images?: boolean;
+    schema?: object; readOnly?: boolean; images?: boolean; signal?: AbortSignal;
   }): Promise<TurnResult> {
     const agent = ref.agent as AgentId;
+    const watcher = budgetWatcher(agent, this.budgetFor(agent, opts.phase));
+    // A stoppable task turn: the Stop confirm reads its elapsed time and tokens so far.
+    if (opts.signal && opts.taskId) {
+      this.watchers.set(opts.taskId, watcher);
+      this.store.updateTask(this.key, opts.taskId, { turnStartedAt: this.deps.now().toISOString() });
+    }
     const prior = opts.session === "lane" && !this.rotate.has(agent) ? this.store.session(this.key, agent) : undefined;
     const logFile = this.logFile(`${opts.taskId ?? opts.phase}-${agent}`);
     const result = await this.deps.runTurn({
@@ -414,8 +481,9 @@ ${r.output}` });
       checkCommands: [...new Set([...this.plan.header.checks, ...this.plan.tasks.flatMap((t) => t.checks)])],
       timeoutMs: opts.phase === "review" ? this.cfg.reviewTimeoutMs : this.cfg.taskTimeoutMs,
       onLine: (line) => this.emit("event", { type: "line", agent, taskId: opts.taskId, line }),
-      abortOn: budgetWatcher(agent, this.budgetFor(agent, opts.phase)),
+      abortOn: watcher, signal: opts.signal,
     });
+    if (opts.signal && opts.taskId) this.watchers.delete(opts.taskId);
     const effective = effectiveTokens(result.usage);
     const outcome = result.usageLimit ? "usage-limit" : result.aborted ? "aborted" : result.timedOut ? "timeout" : result.code === 0 ? "done" : "failed";
     this.store.addRun({ planId: this.key, taskId: opts.taskId, agent, model: ref.model ?? null, phase: opts.phase, outcome,
@@ -442,10 +510,30 @@ ${r.output}` });
     return result;
   }
 
+  /** The only writer of task state: every move goes through the lifecycle table. */
+  private setState(taskId: string, event: TaskEvent, patch: TaskPatch = {}, show: { note?: string; details?: string } = {}): TaskState {
+    const row = this.store.task(this.key, taskId);
+    const to = transition(row?.status ?? "queued", event);
+    this.store.updateTask(this.key, taskId, { ...patch, status: to, phaseStartedAt: this.deps.now().toISOString() });
+    const agent = patch.agent === undefined ? row?.agent : patch.agent;
+    this.say({ type: "task", taskId, status: to, ...(agent ? { agent } : {}), ...(show.note ? { note: show.note } : {}),
+      ...(show.details ? { details: clipDetails(show.details) } : {}) });
+    return to;
+  }
+
   private async runTask(t: PlanTask, ref: AgentRef): Promise<void> {
+    const ctl = new AbortController();
+    this.controllers.set(t.id, ctl);
+    try {
+      await this.work(t, ref, ctl);
+    } finally {
+      this.controllers.delete(t.id);
+    }
+  }
+
+  private async work(t: PlanTask, ref: AgentRef, ctl: AbortController): Promise<void> {
     const agent = ref.agent as AgentId;
-    this.store.updateTask(this.key, t.id, { status: "running", agent, model: ref.model ?? null, note: null });
-    this.say({ type: "task", taskId: t.id, status: "running", agent });
+    this.setState(t.id, "dispatch", { agent, model: ref.model ?? null, note: null });
     this.mark(t.id, { done: false });
     const lane = await this.lane(agent);
     const fenced = agent === "opencode";
@@ -458,10 +546,10 @@ ${r.output}` });
     if (!continuing) {
       if (await g.stashWip(lane.path, `harnessOrch leftover before ${t.id}`)) this.say({ type: "info", message: `${agent} lane had leftover changes; stashed` });
       await this.syncLaneDeps(lane);
-      // A human resume puts the paused attempt's work back instead of redoing it from scratch.
+      // A human resume puts the parked attempt's work back instead of redoing it from scratch.
       const parked = resumedByHuman ? await g.findStash(lane.path, this.parkLabel(t)) : null;
       if (parked && await g.applyStash(lane.path, parked)) {
-        this.say({ type: "info", message: `${t.id}: restored the paused attempt's work` });
+        this.say({ type: "info", message: `${t.id}: restored its parked work` });
         continuing = hasSession;
       }
     }
@@ -478,55 +566,68 @@ ${r.output}` });
     const history: string[] = [];
 
     for (;;) {
-      if (this.stopped) {
-        this.store.updateTask(this.key, t.id, { status: "pending" });
-        return;
-      }
-      const r = await this.turn(ref, { cwd: lane.path, prompt, taskId: t.id, phase: attempts ? "fix" : "implement", session: "lane", schema: RESULT_SCHEMA, images: t.images });
+      // A plan-wide stop lets the current round finish, then stops the task like Stop would.
+      if (this.stopped) ctl.abort();
+      if (ctl.signal.aborted) return this.stopParked(t, lane);
+      const r = await this.turn(ref, { cwd: lane.path, prompt, taskId: t.id, phase: attempts ? "fix" : "implement", session: "lane", schema: RESULT_SCHEMA, images: t.images, signal: ctl.signal });
+      // A stop and a budget kill both abort the turn; only the stop's signal is set.
+      if (ctl.signal.aborted) return this.stopParked(t, lane);
       if (r.usageLimit) {
         await g.discardChanges(lane.path);
         this.store.dropSession(this.key, agent);
-        this.store.updateTask(this.key, t.id, { status: "pending", agent: null });
-        this.say({ type: "task", taskId: t.id, status: "pending", note: `${agent} at usage limit` });
+        this.setState(t.id, "usageLimit", { agent: null }, { note: `${agent} at usage limit` });
         return;
       }
       const result = parseWorkerResult(r.structured);
       if (result) history.push(`${result.status}: ${result.summary}`);
       let failure: { reason: string; details: string } | null = null;
       if (!result) failure = { reason: r.aborted ?? (r.timedOut ? "the run timed out" : `no valid result (exit ${r.code})`), details: r.text.slice(-1500) };
-      else if (result.status === "blocked") return this.escalate(t, lane, "the agent is blocked", result.questions.join("\n") || result.summary, attempts, history);
+      else if (result.status === "blocked") return this.escalate(t, lane, "blocked", "the agent is blocked", result.questions.join("\n") || result.summary, attempts, history);
       else if (result.status === "failed") failure = { reason: "the agent reported failure", details: result.summary };
-      else failure = await this.verify(t, lane);
-
-      if (!failure) {
-        const merged = await this.complete(t, lane, result as WorkerResult);
-        if (merged === true) return;
-        failure = merged;
+      else {
+        this.setState(t.id, "turnFinished");
+        failure = await this.verify(t, lane, ctl.signal);
+        if (ctl.signal.aborted) return this.stopParked(t, lane);
+        if (!failure) {
+          this.setState(t.id, "passed");
+          const merged = await this.complete(t, lane, result);
+          if (merged === true) return;
+          failure = merged;
+          // A stop pressed during the merge waited for it. The merge failed, so stop instead of a fix round.
+          if (ctl.signal.aborted) return this.stopParked(t, lane);
+        }
       }
       attempts++;
       this.store.updateTask(this.key, t.id, { attempts });
-      if (attempts >= this.cfg.maxAttempts) return this.escalate(t, lane, failure.reason, failure.details, attempts, history);
-      this.say({ type: "task", taskId: t.id, status: "running", agent, note: `attempt ${attempts + 1}: ${failure.reason}`, details: clipDetails(failure.details) });
+      if (attempts >= this.cfg.maxAttempts) return this.escalate(t, lane, "attemptsExhausted", failure.reason, failure.details, attempts, history);
+      this.setState(t.id, "failed", {}, { note: `attempt ${attempts + 1}: ${failure.reason}`, details: failure.details });
       prompt = renderFixPrompt(t, failure.reason, failure.details, fenced);
     }
   }
 
+  /** Stop: park the edits (Resume restores them) and wait for the human. */
+  private async stopParked(t: PlanTask, lane: Lane): Promise<void> {
+    const parked = await this.park(t, lane);
+    const note = parked ? "stopped by you; edits kept on the stash" : "stopped by you";
+    this.setState(t.id, "stop", { note }, { note });
+  }
+
   /** Keep a stuck task's work recoverable on the stash and give the lane back clean. */
-  private async park(t: PlanTask, lane: Lane): Promise<void> {
-    if (await g.stashWip(lane.path, this.parkLabel(t))) {
-      this.say({ type: "info", message: `${t.id}: unfinished work kept on the stash in ${lane.path}; Resume restores it` });
-    }
+  private async park(t: PlanTask, lane: Lane): Promise<boolean> {
+    if (!(await g.stashWip(lane.path, this.parkLabel(t)))) return false;
+    this.say({ type: "info", message: `${t.id}: unfinished work kept on the stash in ${lane.path}; Resume restores it` });
+    return true;
   }
 
   private parkLabel(t: PlanTask): string {
     return `harnessOrch ${this.id} ${t.id} (paused)`;
   }
 
-  /** Paused tasks a human resumed on the same agent: restore their parked work. */
+  /** Tasks a human resumed on the same agent: restore their parked work. */
   private readonly resumed = new Set<string>();
 
   /** The engine's own definition of done: scope, then checks. */
-  private async verify(t: PlanTask, lane: Lane): Promise<{ reason: string; details: string } | null> {
+  private async verify(t: PlanTask, lane: Lane, signal?: AbortSignal): Promise<{ reason: string; details: string } | null> {
     const paths = await changedPaths(lane.path);
     // Manifests are always in scope: agents may add dev dependencies on their own.
     const violations = scopeViolations(paths, [...t.writeScope, ...MANIFEST_GLOBS], this.protectedPaths);
@@ -544,7 +645,7 @@ ${r.output}` });
     }
     const checks = t.checks.length ? t.checks : this.plan.header.checks;
     if (!checks.length) return null;
-    const results = await this.deps.runChecks(checks, lane.path, join(this.stateDir, "checks"));
+    const results = await this.deps.runChecks(checks, lane.path, join(this.stateDir, "checks"), undefined, signal);
     if (checksPassed(results)) return null;
     return { reason: "checks failed", details: [reverted, formatCheckFailures(results)].filter(Boolean).join("\n\n") };
   }
@@ -599,9 +700,8 @@ ${r.output}` });
       outcome = await this.serialMerge(() => this.planChecks());
     }
     if (outcome !== true) return outcome;
-    this.store.updateTask(this.key, t.id, { status: "done", summary: result.summary, decisions: result.decisions, note: null });
+    this.setState(t.id, "merged", { summary: result.summary, decisions: result.decisions, note: null });
     this.mark(t.id, { done: true });
-    this.say({ type: "task", taskId: t.id, status: "done", agent: lane.agent });
     return true;
   }
 
@@ -671,8 +771,9 @@ ${r.output}` });
   }
 
   /** A guardrail fired: ask the orchestrator once (Codex, then Opus), else pause for the human. */
-  private async escalate(t: PlanTask, lane: Lane, reason: string, details: string, attempts: number, history: string[]): Promise<void> {
+  private async escalate(t: PlanTask, lane: Lane, event: "blocked" | "attemptsExhausted", reason: string, details: string, attempts: number, history: string[]): Promise<void> {
     const agent = lane.agent;
+    this.setState(t.id, event);
     const row = this.store.task(this.key, t.id);
     if (!row?.orchestrated) {
       this.store.updateTask(this.key, t.id, { orchestrated: true });
@@ -683,14 +784,13 @@ ${r.output}` });
           this.reassign(t, decision.agent);
           await this.park(t, lane);
         } else this.continuing.add(t.id);
-        this.store.updateTask(this.key, t.id, { status: "pending", attempts: 0 });
-        this.say({ type: "task", taskId: t.id, status: "pending", note: `orchestrator: ${decision.action}${decision.agent ? ` → ${decision.agent}` : ""}` });
+        this.setState(t.id, "retry", { attempts: 0 }, { note: `orchestrator: ${decision.action}${decision.agent ? ` → ${decision.agent}` : ""}` });
         return;
       }
       if (decision) details = `${decision.guidance}\n\n${details}`;
     }
     await this.park(t, lane);
-    this.pause(t.id, `${reason}: ${details.split("\n")[0].slice(0, 200)}`, details);
+    this.pause(t.id, "human", `${reason}: ${details.split("\n")[0].slice(0, 200)}`, details);
   }
 
   /** Tasks the orchestrator sent back to the same agent: resume in place, keep the work tree. */
@@ -708,10 +808,9 @@ ${r.output}` });
     return null;
   }
 
-  private pause(taskId: string, note: string, details?: string): void {
-    this.store.updateTask(this.key, taskId, { status: "paused", note });
+  private pause(taskId: string, event: "human" | "error", note: string, details?: string): void {
+    this.setState(taskId, event, { note }, { note, ...(details ? { details } : {}) });
     this.mark(taskId, { done: false, note: `⏸ needs you: ${note.slice(0, 120)}` });
-    this.say({ type: "task", taskId, status: "paused", note, ...(details ? { details: clipDetails(details) } : {}) });
     this.say({ type: "needs-you", taskId, message: `${taskId} paused: ${note}` });
   }
 
@@ -720,28 +819,108 @@ ${r.output}` });
     const t = this.task(taskId);
     const row = this.store.task(this.key, taskId);
     // A blocked agent asked a question; resending the same task without an answer just buys the same question again.
-    if (row?.status === "paused" && row.note?.startsWith("the agent is blocked") && !opts.guidance?.trim() && (!opts.agent || opts.agent === row.agent)) {
+    if (row?.status === "waiting" && row.note?.startsWith("the agent is blocked") && !opts.guidance?.trim() && (!opts.agent || opts.agent === row.agent)) {
       throw new Error(`${taskId} is waiting for an answer to its question. Write your answer in the box, pick another agent, or skip the task.`);
     }
+    if (!row || !canTransition(row.status, "resume")) throw new Error(`${taskId} is ${row?.status ?? "unknown"}; only a task that needs you can be resumed`);
     if (opts.guidance) this.guidance.set(taskId, opts.guidance);
     const current = row?.agent;
     if (opts.agent && opts.agent !== current) this.reassign(t, opts.agent);
     else this.resumed.add(taskId);
     // The orchestrator is not asked again: a human already looked, so a repeat failure comes straight back to you.
-    this.store.updateTask(this.key, taskId, { status: "pending", attempts: 0, note: null });
+    this.setState(taskId, "resume", { attempts: 0, note: null }, { note: row.status === "interrupted" ? "continued after the app closed" : "resumed by you" });
     this.mark(taskId, { done: false });
-    this.say({ type: "task", taskId, status: "pending", note: "resumed by you" });
     this.wakeUp();
   }
 
-  /** The human decided a paused or pending task is not needed: count it as done (no commit) so dependents can run. */
+  /** Start the task over: drop its parked edits and attempts; its next turn gets a fresh brief. */
+  async restartClean(taskId: string): Promise<void> {
+    const row = this.store.task(this.key, taskId);
+    if (!row || !canTransition(row.status, "restartClean")) throw new Error(`${taskId} is ${row?.status ?? "unknown"}; only a task that needs you can be restarted`);
+    const lanePath = row.agent ? join(this.wtRoot, row.agent) : null;
+    if (lanePath && existsSync(lanePath)) await g.dropStash(lanePath, this.parkLabel(this.task(taskId)));
+    this.guidance.delete(taskId);
+    this.resumed.delete(taskId);
+    this.continuing.delete(taskId);
+    this.setState(taskId, "restartClean", { attempts: 0, orchestrated: false, note: null }, { note: "restarted clean by you" });
+    this.mark(taskId, { done: false });
+    this.wakeUp();
+  }
+
+  /**
+   * Stop one task now: kill its agent or check and park its edits. Its dependents wait.
+   * During a merge the stop takes effect once the merge finishes.
+   */
+  stopTask(taskId: string): void {
+    const row = this.store.task(this.key, taskId);
+    const ctl = this.controllers.get(taskId);
+    if (!row || !ctl || !STOPPABLE.includes(row.status)) {
+      throw new Error(`${taskId} is ${row?.status ?? "unknown"}; only a working, checking or merging task can be stopped`);
+    }
+    ctl.abort();
+    this.say({ type: "info", message: row.status === "merging" ? `${taskId}: stop requested; it takes effect when the merge finishes` : `${taskId}: stopping` });
+  }
+
+  /** No new dispatches, and every stoppable task in flight is stopped. Returns the tasks stopped. */
+  stopAll(): string[] {
+    this.stop();
+    const stopped: string[] = [];
+    for (const [id, ctl] of this.controllers) {
+      const state = this.store.task(this.key, id)?.status;
+      if (!state || !STOPPABLE.includes(state)) continue;
+      ctl.abort();
+      stopped.push(id);
+    }
+    if (stopped.length) this.say({ type: "info", message: `stopping ${stopped.join(", ")}` });
+    return stopped;
+  }
+
+  /** The facts for the Stop confirm. */
+  async stopInfo(taskId: string): Promise<StopInfo> {
+    const row = this.store.task(this.key, taskId);
+    if (!row) throw new Error(`unknown task ${taskId}`);
+    const now = this.deps.now().getTime();
+    const since = (iso: string | null): number | null => (iso ? Math.max(0, now - Date.parse(iso)) : null);
+    const lanePath = row.agent ? join(this.wtRoot, row.agent) : null;
+    const watcher = this.watchers.get(taskId);
+    return {
+      taskId, state: row.status, agent: row.agent,
+      stoppable: STOPPABLE.includes(row.status) && this.controllers.has(taskId),
+      deferred: row.status === "merging",
+      phaseElapsedMs: since(row.phaseStartedAt),
+      turnElapsedMs: row.status === "working" ? since(row.turnStartedAt) : null,
+      tokensSoFar: row.agent === "codex" || !watcher ? null : watcher.spent,
+      tokensNote: row.agent === "codex" ? "Codex reports tokens when the turn ends" : null,
+      uncommittedFiles: lanePath && existsSync(lanePath) ? (await changedPaths(lanePath)).length : 0,
+      dependents: this.dependentsOf(taskId),
+      ifStopped: STATE_INFO[row.status].ifStopped,
+      afterwards: ["Resume (edits restored, same session)", "Restart clean (edits dropped)", "Skip"],
+    };
+  }
+
+  /** Unfinished tasks that depend on `taskId`, directly or through other tasks. */
+  private dependentsOf(taskId: string): string[] {
+    const states = new Map(this.store.tasks(this.key).map((r) => [r.id, r.status]));
+    const out = new Set<string>();
+    const visit = (id: string): void => {
+      for (const t of this.plan.tasks) {
+        if (!t.dependsOn.includes(id) || out.has(t.id)) continue;
+        out.add(t.id);
+        visit(t.id);
+      }
+    };
+    visit(taskId);
+    return [...out].filter((id) => !FINAL.includes(states.get(id) ?? "queued"));
+  }
+
+  /** The human decided a task is not needed: it counts as finished (no commit) so dependents can run. */
   skipTask(taskId: string): void {
     const row = this.store.task(this.key, taskId);
-    if (row?.status === "running") throw new Error(`${taskId} is running; stop the plan first`);
-    if (row?.status === "done") return;
-    this.store.updateTask(this.key, taskId, { status: "done", summary: "Skipped by you.", note: null });
+    const state = row?.status ?? "queued";
+    if (FINAL.includes(state)) return;
+    if (!canTransition(state, "skip")) throw new Error(`${taskId} is ${state}; stop it first`);
+    this.setState(taskId, "skip", { summary: "Skipped by you.", note: null }, { note: "skipped by you" });
     this.mark(taskId, { done: true });
-    this.say({ type: "task", taskId, status: "done", note: "skipped by you" });
     this.wakeUp();
   }
 
@@ -772,7 +951,7 @@ ${r.output}` });
     const rows = this.store.tasks(this.key);
     const pendingForAgent = this.plan.tasks.some((t) => {
       const row = rows.find((r) => r.id === t.id);
-      if (row?.status === "done") return false;
+      if (row && FINAL.includes(row.status)) return false;
       return row?.agent === agent || this.candidates(t)[0]?.agent === agent;
     });
     return !pendingForAgent;
@@ -957,7 +1136,8 @@ ${r.output}` });
       checks: this.plan?.header.checks ?? [], skills: this.plan?.header.skills ?? [], baseBranch: this.baseBranch || null,
       tasks: (this.plan?.tasks ?? []).map((t) => {
         const r = rows.get(t.id);
-        return { ...t, status: r?.status ?? (t.done ? "done" : "pending"), assigned: r?.agent ?? this.candidates(t)[0]?.agent ?? null,
+        const status: TaskState = r?.status ?? (t.done ? "done" : "queued");
+        return { ...t, status, next: STATE_INFO[status].next, phaseStartedAt: r?.phaseStartedAt ?? null, assigned: r?.agent ?? this.candidates(t)[0]?.agent ?? null,
           note: r?.note ?? null, attempts: r?.attempts ?? 0, summary: r?.summary ?? null, decisions: r?.decisions ?? [], commits: this.commitsOf(t.id) };
       }),
       runs,

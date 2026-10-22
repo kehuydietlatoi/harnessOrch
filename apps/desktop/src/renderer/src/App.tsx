@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type EventView, type PlanListItem, type RunnerEvent, type Snapshot } from "./api";
+import { api, STOPPABLE, type EventView, type PlanListItem, type RunnerEvent, type Snapshot } from "./api";
 import { Board } from "./Board";
 import { Drawer, useTerminals } from "./Drawer";
 import { banner, formatLine } from "./format";
@@ -17,6 +17,7 @@ export function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(initialHash.get("task"));
+  const [confirmStop, setConfirmStop] = useState(false);
   const term = useTerminals(setError);
 
   useEffect(() => { const tab = initialHash.get("tab"); if (tab) term.setActive(tab); }, [term.setActive]);
@@ -63,7 +64,7 @@ export function App() {
         if (text) term.write(`stream:${event.agent}`, `${text}\r\n`);
         return;
       }
-      if (event.type === "task" && event.status === "running" && event.agent) {
+      if (event.type === "task" && event.status === "working" && event.agent) {
         term.write(`stream:${event.agent}`, banner(`${event.taskId}${event.note ? ` · ${event.note}` : ""}`));
         term.followAgent(event.agent);
       }
@@ -97,13 +98,29 @@ export function App() {
         {planFile && <button className="ghost" onClick={() => void api.call("plan:open", planFile)}>Plan file</button>}
         {snap && !snap.running && !["ready", "merged"].includes(status) &&
           <button className="primary" disabled={!!snap.errors.length} onClick={() => void guard(api.call("plan:start", planFile))}>▶ Start</button>}
-        {snap?.running && <button onClick={() => void guard(api.call("plan:stop", planFile))}>■ Stop</button>}
+        {snap?.running && !confirmStop && <button onClick={() => setConfirmStop(true)}>■ Stop</button>}
         {status === "ready" && <button className="primary" onClick={async () => { if (await guard(api.call<string>("plan:merge", planFile))) void refreshSnap(); }}>Merge to {snap?.baseBranch ?? "main"}</button>}
       </header>
 
       {snap && <StatusStrip snap={snap} onSelectTask={setSelected} />}
 
       <div className="banners">
+        {confirmStop && snap && (() => {
+          const stoppable = snap.tasks.filter((t) => STOPPABLE.includes(t.status));
+          return (
+            <div className="confirm-box wide">
+              <div className="confirm-title">Stop the plan?</div>
+              <p className="small-text">No new tasks start.{stoppable.length
+                ? <> These get killed now and their uncommitted edits parked on the stash: {stoppable.map((t) => `${t.id} (${t.assigned ?? "?"}, ${t.status})`).join(", ")}.</>
+                : " Nothing is mid-turn right now."}{stoppable.some((t) => t.status === "merging") ? " A merge in progress finishes first." : ""} Reviews and orchestrator turns finish on their own.
+                Stopped tasks wait under Needs you: Resume, Restart clean or Skip.</p>
+              <div className="row">
+                <button className="ghost small" onClick={() => setConfirmStop(false)}>Keep running</button>
+                <button className="danger small" onClick={() => { setConfirmStop(false); void guard(api.call("plan:stopAll", planFile)); }}>Stop all</button>
+              </div>
+            </div>
+          );
+        })()}
         {error && <div className="banner error" onClick={() => setError(null)}>{error} <span className="muted">(click to dismiss)</span></div>}
         {snap?.errors.map((e) => <div key={e} className="banner error">Plan error: {e}</div>)}
         {snap?.warnings.map((w) => <div key={w} className="banner warn">{w}</div>)}

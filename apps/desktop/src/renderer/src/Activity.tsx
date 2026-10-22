@@ -8,8 +8,9 @@ export function describe(e: EventView): { tone: "info" | "ok" | "warn" | "err" |
     case "task": {
       const who = d.agent ? ` · ${s("agent")}` : "";
       const note = d.note ? ` — ${s("note")}` : "";
-      const tone = d.status === "done" ? "ok" : d.status === "paused" ? "warn" : "info";
-      const verb = { running: "started", done: "done", paused: "paused", pending: "queued" }[s("status")] ?? s("status");
+      const tone = d.status === "done" || d.status === "skipped" ? "ok" : ["waiting", "stopped", "interrupted"].includes(s("status")) ? "warn" : "info";
+      const verb = ({ working: "working", checking: "checking", merging: "merging", escalating: "escalating", waiting: "needs you",
+        stopped: "stopped", interrupted: "interrupted", done: "done", skipped: "skipped", queued: "queued" } as Record<string, string>)[s("status")] ?? s("status");
       return { tone, text: `${s("taskId")} ${verb}${who}${note}`, ...(d.details ? { details: s("details") } : {}) };
     }
     case "run":

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -52,7 +52,8 @@ function writePlan(body: string, header = `checks: ['${PASS}']`): string {
   return file;
 }
 
-type Script = (req: TurnRequest, call: number) => Partial<TurnResult> & { write?: Record<string, string> };
+type Reply = Partial<TurnResult> & { write?: Record<string, string> };
+type Script = (req: TurnRequest, call: number) => Reply | Promise<Reply>;
 
 /** A scripted agent: writes files into its cwd and answers with a structured result. */
 function fakeTurns(script: Script) {
@@ -60,12 +61,13 @@ function fakeTurns(script: Script) {
   let n = 0;
   const runTurn = async (req: TurnRequest): Promise<TurnResult> => {
     calls.push(req);
-    const out = script(req, n++);
+    const call = n++;
+    const out = await script(req, call);
     for (const [file, text] of Object.entries(out.write ?? {})) {
       mkdirSync(join(req.cwd, file, ".."), { recursive: true });
       writeFileSync(join(req.cwd, file), text);
     }
-    const sessionId = req.resumeSession ?? `${req.agent}-session-${n}`;
+    const sessionId = req.resumeSession ?? `${req.agent}-session-${call + 1}`;
     return {
       code: 0, timedOut: false, durationMs: 1, text: "", sessionId,
       usage: { input: 100, cacheRead: 1000, cacheWrite: 50, output: 20, requests: 1, contextTokens: 1150 },
@@ -75,6 +77,12 @@ function fakeTurns(script: Script) {
   return { calls, runTurn };
 }
 
+/** A turn that runs until the task is stopped, then reports what a killed process reports. */
+const untilStopped = (req: TurnRequest): Promise<Reply> => new Promise((resolve) => {
+  const stop = (): void => resolve({ code: 125, aborted: "stopped by you", structured: undefined });
+  if (req.signal?.aborted) stop();
+  else req.signal?.addEventListener("abort", stop, { once: true });
+});
 const done = (summary = "did it") => ({ structured: { status: "done", summary, files_changed: [], decisions: [], questions: [] } });
 const approve = { structured: { decision: "approve", notes: "", followups: [] } };
 const taskId = (prompt: string): string | undefined => /# Task (\S+):|Task (\S+) is not done yet/.exec(prompt)?.slice(1).find(Boolean);
@@ -169,8 +177,8 @@ describe("plan runner", { timeout: 90_000 }, () => {
       return { ...done(), write: { [`src/${id}.txt`]: id } };
     });
     expect(await runner(plan, runTurn, events).run()).toBe("paused");
-    expect(store.task(KEY(), "T1")).toMatchObject({ status: "paused", orchestrated: true });
-    expect(store.task(KEY(), "T2")?.status).toBe("pending");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "waiting", orchestrated: true });
+    expect(store.task(KEY(), "T2")?.status).toBe("queued");
     expect(store.task(KEY(), "T3")?.status).toBe("done");
     // Codex was asked first, then Opus (Codex said human).
     expect(calls.filter((c) => c.prompt.startsWith("You are the orchestrator")).map((c) => [c.agent, c.model.model, c.readOnly]))
@@ -382,15 +390,15 @@ write_scope: [src/T1.txt]`));
     };
     const r = runner(plan, runTurn);
     const running = r.run();
-    await expect.poll(() => store.task(KEY(), "T1")?.status, { timeout: 30_000 }).toBe("paused");
-    expect(store.task(KEY(), "T2")?.status).toBe("running");
+    await expect.poll(() => store.task(KEY(), "T1")?.status, { timeout: 30_000 }).toBe("waiting");
+    expect(store.task(KEY(), "T2")?.status).toBe("working");
 
     await r.prepare(); // what the app's Resume handler does first
     r.resumeTask("T1", { guidance: "deps are linked now" });
-    expect(store.task(KEY(), "T2")?.status).toBe("running");
+    expect(store.task(KEY(), "T2")?.status).toBe("working");
     // T1 restarts while T2 is still mid-turn.
     await expect.poll(() => store.task(KEY(), "T1")?.status, { timeout: 30_000 }).toBe("done");
-    expect(store.task(KEY(), "T2")?.status).toBe("running");
+    expect(store.task(KEY(), "T2")?.status).toBe("working");
     releaseT2();
     expect(await running).toBe("ready");
 
@@ -444,10 +452,183 @@ write_scope: [src/T1.txt]`));
     expect(() => r.resumeTask("T1")).toThrow(/waiting for an answer/);
     expect(() => r.resumeTask("T1", { guidance: "   " })).toThrow(/waiting for an answer/);
     r.skipTask("T1");
-    expect(store.task(KEY(), "T1")).toMatchObject({ status: "done", summary: "Skipped by you." });
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "skipped", summary: "Skipped by you." });
     expect(readFileSync(plan, "utf8")).toContain("- [x] **T1 — Asks**");
     expect(await r.run()).toBe("ready");
     expect(store.task(KEY(), "T2")?.status).toBe("done");
+  });
+
+  it("stops a working task: kills the turn, parks its edits, holds its dependents, keeps others going; Resume restores them", async () => {
+    const plan = writePlan([
+      task("T1", "Long", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt, src/T1b.txt]`),
+      task("T2", "After", `agent: codex\ndepends_on: [T1]\ngoal: g\nwrite_scope: [src/T2.txt]`),
+      task("T3", "Independent", `agent: claude\ngoal: g\nwrite_scope: [src/T3.txt]`),
+    ].join("\n"));
+    let resumedSaw: string | null = null;
+    const { calls, runTurn } = fakeTurns(async (req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.startsWith("# Task T1")) {
+        writeFileSync(join(req.cwd, "src", "T1.txt"), "half");
+        return untilStopped(req);
+      }
+      if (req.prompt.includes("the human answered")) {
+        resumedSaw = readFileSync(join(req.cwd, "src", "T1.txt"), "utf8");
+        return { ...done(), write: { "src/T1b.txt": "rest" } };
+      }
+      const id = taskId(req.prompt)!;
+      return { ...done(), write: { [`src/${id}.txt`]: id } };
+    });
+    const r = runner(plan, runTurn);
+    const running = r.run();
+    await expect.poll(() => calls.some((c) => c.prompt.startsWith("# Task T1")), { timeout: 30_000 }).toBe(true);
+    const info = await r.stopInfo("T1");
+    expect(info).toMatchObject({ state: "working", agent: "codex", stoppable: true, deferred: false, uncommittedFiles: 1, dependents: ["T2"], tokensSoFar: null });
+    expect(info.turnElapsedMs).not.toBeNull();
+    r.stopTask("T1");
+    expect(await running).toBe("paused");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "stopped", note: "stopped by you; edits kept on the stash" });
+    expect(store.task(KEY(), "T2")?.status).toBe("queued");
+    expect(store.task(KEY(), "T3")?.status).toBe("done");
+    expect(sh(join(root, "wt", "codex"), "stash", "list", "--format=%gs")).toContain("harnessOrch demo T1 (paused)");
+    expect(() => r.stopTask("T1")).toThrow(/only a working, checking or merging task/);
+
+    // The killed turn still reported its session: the resumed turn continues it.
+    const session = store.session(KEY(), "codex")?.sessionId;
+    expect(session).toBeDefined();
+    r.resumeTask("T1");
+    expect(await r.run()).toBe("ready");
+    expect(resumedSaw).toBe("half");
+    expect(calls.find((c) => c.prompt.includes("the human answered"))!.resumeSession).toBe(session);
+    expect(sh(repo, "show", "harness/demo:src/T1.txt")).toBe("half");
+    expect(store.task(KEY(), "T2")?.status).toBe("done");
+  });
+
+  it("Restart clean drops the parked edits and starts from a fresh brief", async () => {
+    const plan = writePlan(task("T1", "Again", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt, src/junk.txt]`));
+    let briefs = 0;
+    let sawJunk = true;
+    const { runTurn } = fakeTurns(async (req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.startsWith("# Task T1")) briefs++;
+      if (briefs === 1) {
+        writeFileSync(join(req.cwd, "src", "junk.txt"), "junk");
+        return untilStopped(req);
+      }
+      sawJunk = existsSync(join(req.cwd, "src", "junk.txt"));
+      return { ...done(), write: { "src/T1.txt": "clean" } };
+    });
+    const r = runner(plan, runTurn);
+    const running = r.run();
+    await expect.poll(() => briefs, { timeout: 30_000 }).toBe(1);
+    r.stopTask("T1");
+    expect(await running).toBe("paused");
+    await r.restartClean("T1");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "queued", attempts: 0 });
+    expect(sh(join(root, "wt", "codex"), "stash", "list", "--format=%gs")).not.toContain("T1 (paused)");
+    expect(await r.run()).toBe("ready");
+    expect(briefs).toBe(2);
+    expect(sawJunk).toBe(false);
+  });
+
+  it("stops a task while its check runs, killing the check", async () => {
+    const slow = 'node -e "setTimeout(() => {}, 60000)"';
+    const plan = writePlan(task("T1", "Checked", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]\nchecks: ['${slow}']`));
+    const { runTurn } = fakeTurns((req) => req.prompt.startsWith("Review the changes") ? approve : { ...done(), write: { "src/T1.txt": "x" } });
+    const r = runner(plan, runTurn);
+    const running = r.run();
+    await expect.poll(() => store.task(KEY(), "T1")?.status, { timeout: 30_000 }).toBe("checking");
+    const started = Date.now();
+    r.stopTask("T1");
+    expect(await running).toBe("paused");
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "stopped", attempts: 0 });
+  });
+
+  it.each([
+    ["pass", "done"],
+    ["fail", "stopped"],
+  ] as const)("defers a stop during a merge; when the plan checks %s the task ends %s", async (outcome, end) => {
+    const gate = join(root, "merge-gate").replaceAll("\\", "/");
+    writeFileSync(join(root, "plan-check.cjs"), `const f = require("fs");
+setInterval(() => { if (f.existsSync(${JSON.stringify(gate)})) process.exit(${outcome === "pass" ? 0 : 1}); }, 50);\n`);
+    const planCheck = `node ${join(root, "plan-check.cjs").replaceAll("\\", "/")}`;
+    const plan = writePlan(task("T1", "Merging", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]\nchecks: ['${PASS}']`), `checks: ['${planCheck}']`);
+    const { calls, runTurn } = fakeTurns((req) => req.prompt.startsWith("Review the changes") ? approve : { ...done(), write: { "src/T1.txt": "x" } });
+    const r = runner(plan, runTurn);
+    const running = r.run();
+    await expect.poll(() => store.task(KEY(), "T1")?.status, { timeout: 30_000 }).toBe("merging");
+    expect((await r.stopInfo("T1")).deferred).toBe(true);
+    r.stopTask("T1");
+    expect(store.task(KEY(), "T1")?.status).toBe("merging");
+    writeFileSync(gate, "");
+    await expect.poll(() => store.task(KEY(), "T1")?.status, { timeout: 30_000 }).toBe(end);
+    r.stop();
+    await running;
+    // A failed merge under a pending stop does not start a fix round.
+    expect(calls.filter((c) => c.prompt.includes("Task T1 is not done yet"))).toHaveLength(0);
+  });
+
+  it("a budget kill is still a fix round, not a stop", async () => {
+    const plan = writePlan(task("T1", "Runaway", `agent: claude\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const { runTurn } = fakeTurns((req, n) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (n === 0) return { code: 125, aborted: "token budget exceeded (9 > 1 effective tokens)", structured: undefined };
+      return { ...done(), write: { "src/T1.txt": "x" } };
+    });
+    expect(await runner(plan, runTurn).run()).toBe("ready");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "done", attempts: 1 });
+  });
+
+  it("marks tasks left in flight by a closed app interrupted, keeps their edits, and Start continues them", async () => {
+    const plan = writePlan([
+      task("T1", "Cut off", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt, src/T1b.txt]`),
+      task("T2", "After", `agent: codex\ndepends_on: [T1]\ngoal: g\nwrite_scope: [src/T2.txt]`),
+    ].join("\n"));
+    // The first app session: T1's turn writes half its work and never returns.
+    const first = fakeTurns((req) => {
+      writeFileSync(join(req.cwd, "src", "T1.txt"), "half");
+      return new Promise<Reply>(() => undefined);
+    });
+    void runner(plan, first.runTurn).run();
+    await expect.poll(() => first.calls.length, { timeout: 30_000 }).toBe(1);
+    expect(store.task(KEY(), "T1")?.status).toBe("working");
+
+    // The app reopens: a new runner over the same store.
+    let restored: string | null = null;
+    const second = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.includes("Task T1")) {
+        restored ??= existsSync(join(req.cwd, "src", "T1.txt")) ? readFileSync(join(req.cwd, "src", "T1.txt"), "utf8") : "";
+        return { ...done(), write: { "src/T1b.txt": "rest" } };
+      }
+      return { ...done(), write: { "src/T2.txt": "x" } };
+    });
+    const r = runner(plan, second.runTurn);
+    await r.prepare();
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "interrupted", note: "codex was working when the app closed; its edits are kept" });
+    const lane = join(root, "wt", "codex");
+    expect(sh(lane, "status", "--porcelain")).toBe("");
+    expect(await r.run()).toBe("ready");
+    expect(restored).toBe("half");
+    expect(sh(lane, "stash", "list", "--format=%gs")).not.toContain("leftover before T1");
+    expect(sh(repo, "show", "harness/demo:src/T1.txt")).toBe("half");
+  });
+
+  it("Stop all stops every task in flight and dispatches nothing new", async () => {
+    const plan = writePlan([
+      task("T1", "One", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`),
+      task("T2", "Two", `agent: claude\ngoal: g\nwrite_scope: [src/T2.txt]`),
+      task("T3", "Three", `agent: opencode\ngoal: g\nwrite_scope: [src/T3.txt]`),
+    ].join("\n"), `checks: ['${PASS}']\nconcurrency: 2`);
+    const { calls, runTurn } = fakeTurns(async (req) => untilStopped(req));
+    const r = runner(plan, runTurn);
+    const running = r.run();
+    await expect.poll(() => calls.length, { timeout: 30_000 }).toBe(2);
+    expect(r.stopAll().sort()).toEqual(["T1", "T2"]);
+    expect(await running).toBe("stopped");
+    await expect.poll(() => [store.task(KEY(), "T1")?.status, store.task(KEY(), "T2")?.status], { timeout: 30_000 }).toEqual(["stopped", "stopped"]);
+    expect(store.task(KEY(), "T3")?.status).toBe("queued");
+    expect(calls).toHaveLength(2);
   });
 
   it("refuses to start an invalid plan", async () => {

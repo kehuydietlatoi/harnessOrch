@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fmtDuration, fmtTime, fmtTokens, type Snapshot } from "./api";
+import { fmtDuration, fmtTime, fmtTokens, groupOf, type Snapshot } from "./api";
 
 /** Plan progress plus one live chip per agent: what it is doing, and what it has cost. */
 export function StatusStrip(props: { snap: Snapshot; onSelectTask: (id: string) => void }) {
@@ -12,10 +12,10 @@ export function StatusStrip(props: { snap: Snapshot; onSelectTask: (id: string) 
   }, [snap.running]);
 
   const total = snap.tasks.length;
-  const count = (s: string): number => snap.tasks.filter((t) => t.status === s).length;
+  const count = (g: ReturnType<typeof groupOf>): number => snap.tasks.filter((t) => groupOf(t.status) === g).length;
   const done = count("done");
   const running = count("running");
-  const paused = count("paused");
+  const paused = count("needs-you");
   const totalTokens = snap.agents.reduce((n, a) => n + a.effective, 0);
   // A finished or paused plan stops its clock at the last thing that happened.
   const end = snap.running ? now : Date.parse(snap.events.at(-1)?.ts ?? snap.startedAt ?? new Date(now).toISOString());

@@ -27,16 +27,17 @@ export interface CheckResult {
  * Run trusted check commands (from the plan the user approved) through the
  * shell, stopping at the first failure. Credentials are scrubbed from the env.
  */
-export async function runChecks(commands: readonly string[], cwd: string, logDir: string, timeoutMs = 900_000): Promise<CheckResult[]> {
+export async function runChecks(commands: readonly string[], cwd: string, logDir: string, timeoutMs = 900_000, signal?: AbortSignal): Promise<CheckResult[]> {
   mkdirSync(logDir, { recursive: true });
   const results: CheckResult[] = [];
   for (const [i, command] of commands.entries()) {
+    if (signal?.aborted) break;
     const logFile = join(logDir, `check-${Date.now()}-${i}.log`);
-    const r = await spawnLogged(command, [], { cwd, shell: true, logFile, timeoutMs, env: cleanEnvironment() });
+    const r = await spawnLogged(command, [], { cwd, shell: true, logFile, timeoutMs, env: cleanEnvironment(), signal });
     let raw = "";
     try { raw = readFileSync(logFile, "utf8"); } catch { /* never started */ }
     const passed = r.code === 0;
-    const excerpt = r.timedOut ? `timed out after ${Math.round(timeoutMs / 1000)}s\n${filterCheckOutput(raw, false)}` : filterCheckOutput(raw, passed);
+    const excerpt = r.aborted ? r.aborted : r.timedOut ? `timed out after ${Math.round(timeoutMs / 1000)}s\n${filterCheckOutput(raw, false)}` : filterCheckOutput(raw, passed);
     results.push({ command, passed, code: r.code, excerpt, logFile });
     if (!passed) break;
   }

@@ -185,7 +185,16 @@ handle("plan:start", (file: string) => {
   void r.run().catch((error: unknown) => send("runner:event", { file, event: { type: "info", message: `run failed: ${String(error)}` } }));
   return true;
 });
-handle("plan:stop", (file: string) => { runnerFor(file).stop(); return true; });
+handle("plan:stopAll", (file: string) => runnerFor(file).stopAll());
+handle("plan:stopTask", (file: string, taskId: string) => { runnerFor(file).stopTask(taskId); return true; });
+handle("plan:stopInfo", (file: string, taskId: string) => runnerFor(file).stopInfo(taskId));
+handle("plan:restartClean", async (file: string, taskId: string) => {
+  const r = runnerFor(file);
+  await r.prepare();
+  await r.restartClean(taskId);
+  if (!r.running) void r.run();
+  return true;
+});
 handle("plan:setAgent", (file: string, taskId: string, agent: string | null) => {
   writeFileSync(file, setTaskAgent(readFileSync(file, "utf8"), taskId, agent ?? undefined));
   return true;

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityList } from "./Activity";
-import { AGENTS, api, prefs, type Agent, type EventView, type Snapshot } from "./api";
+import { AGENTS, api, NEEDS_YOU, prefs, type Agent, type EventView, type Snapshot } from "./api";
 import { Term, type TermHandle } from "./Term";
 
 export type TabKind = "activity" | "planner" | "stream" | "takeover";
@@ -123,7 +123,7 @@ export function Drawer(props: {
 
   const activeTab = term.tabs.find((t) => t.key === term.active) ?? term.tabs[0];
   // What is waiting on you right now, not how often it happened.
-  const needsYou = (snap?.tasks.filter((t) => t.status === "paused").length ?? 0) + props.blockedReviews;
+  const needsYou = (snap?.tasks.filter((t) => NEEDS_YOU.includes(t.status)).length ?? 0) + props.blockedReviews;
 
   return (
     <section className={`drawer ${collapsed ? "collapsed" : ""}`} style={{ height: collapsed ? COLLAPSED : height }}>

@@ -1,3 +1,7 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { claudeTurnArgs, codexTurnArgs, opencodeTurnArgs, reduceClaude, reduceCodex, reduceOpencodeTurn, structuredFrom } from "../src/agents/turn.js";
 import { estimateTokens, parseWorkerResult, renderBrief, renderHandoff, RESULT_SCHEMA } from "../src/brief/brief.js";
@@ -170,7 +174,9 @@ describe("effective tokens", () => {
     // Thinking, text and three tool calls of the same request: 400, not 2000.
     for (let i = 0; i < 5; i++) expect(watch(block("msg_1"))).toBeUndefined();
     expect(watch(block("msg_2"))).toBeUndefined();
+    expect(watch.spent).toBe(800);
     expect(watch(block("msg_3"))).toMatch(/1200 > 1000/);
+    expect(watch.spent).toBe(1200);
   });
 
   it("records the real usage of a Claude turn killed before its result", () => {
@@ -191,7 +197,7 @@ describe("effective tokens", () => {
 
 describe("scheduler", () => {
   const codex = { agent: "codex" }, claude = { agent: "claude" }, oc = { agent: "opencode" };
-  const t = (id: string, o: Partial<SchedTask> = {}): SchedTask => ({ id, dependsOn: [], status: "pending", writeScope: [`src/${id}/**`], candidates: [codex], ...o });
+  const t = (id: string, o: Partial<SchedTask> = {}): SchedTask => ({ id, dependsOn: [], status: "queued", writeScope: [`src/${id}/**`], candidates: [codex], ...o });
 
   it("starts ready tasks in plan order, one per agent, up to concurrency", () => {
     const tasks = [t("a"), t("b"), t("c", { candidates: [claude] }), t("d", { candidates: [oc] }), t("e", { dependsOn: ["a"], candidates: [oc] })];
@@ -206,23 +212,46 @@ describe("scheduler", () => {
     expect(nextDispatches({ tasks, concurrency: 3, busyAgents: new Set(), unavailable: new Set(["opencode"]) })).toEqual([{ taskId: "a", ref: codex }]);
   });
 
-  it("never runs overlapping write scopes together and holds back dependents of paused tasks", () => {
-    const tasks = [t("a", { status: "running", writeScope: ["src/**"] }), t("b", { candidates: [claude] }), t("c", { candidates: [oc], writeScope: ["docs/**"] })];
+  it("never runs overlapping write scopes together and holds back dependents of tasks that need you", () => {
+    const tasks = [t("a", { status: "checking", writeScope: ["src/**"] }), t("b", { candidates: [claude] }), t("c", { candidates: [oc], writeScope: ["docs/**"] })];
     expect(nextDispatches({ tasks, concurrency: 3, busyAgents: new Set(["codex"]), unavailable: new Set() }).map((d) => d.taskId)).toEqual(["c"]);
-    const paused = [t("a", { status: "paused" }), t("b", { dependsOn: ["a"] }), t("c", { dependsOn: ["b"] }), t("d")];
-    expect(nextDispatches({ tasks: paused, concurrency: 3, busyAgents: new Set(), unavailable: new Set() }).map((d) => d.taskId)).toEqual(["d"]);
-    expect([...blockedBy(paused)]).toEqual([["b", "a"], ["c", "a"]]);
+    for (const status of ["waiting", "stopped", "interrupted"] as const) {
+      const paused = [t("a", { status }), t("b", { dependsOn: ["a"] }), t("c", { dependsOn: ["b"] }), t("d")];
+      expect(nextDispatches({ tasks: paused, concurrency: 3, busyAgents: new Set(), unavailable: new Set() }).map((d) => d.taskId)).toEqual(["d"]);
+      expect([...blockedBy(paused)]).toEqual([["b", "a"], ["c", "a"]]);
+    }
+  });
+
+  it("lets skipped tasks satisfy their dependents", () => {
+    const tasks = [t("a", { status: "skipped" }), t("b", { dependsOn: ["a"] })];
+    expect(nextDispatches({ tasks, concurrency: 3, busyAgents: new Set(), unavailable: new Set() }).map((d) => d.taskId)).toEqual(["b"]);
   });
 });
 
 describe("store", () => {
+  it("migrates task statuses from before the lifecycle, and adds the timing columns", () => {
+    const file = join(mkdtempSync(join(tmpdir(), "store-")), "h.db");
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE tasks (plan_id TEXT NOT NULL, id TEXT NOT NULL, status TEXT NOT NULL, agent TEXT, model TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0, note TEXT, summary TEXT, decisions TEXT NOT NULL DEFAULT '[]',
+      commit_sha TEXT, orchestrated INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (plan_id, id));
+      INSERT INTO tasks (plan_id, id, status) VALUES ('p', 'A', 'pending'), ('p', 'B', 'running'), ('p', 'C', 'paused'), ('p', 'D', 'done');`);
+    old.close();
+    const s = new Store(file);
+    expect(s.tasks("p").map((t) => [t.id, t.status, t.phaseStartedAt])).toEqual([
+      ["A", "queued", null], ["B", "interrupted", null], ["C", "waiting", null], ["D", "done", null]]);
+    s.close();
+  });
+
   it("persists plans, tasks, sessions, runs, reviews and events", () => {
     const s = new Store(":memory:");
     s.upsertPlan({ id: "p", repo: "/r", file: ".harness/plans/p.md", baseBranch: "main", planBranch: "harness/p", status: "running" });
     s.syncTasks("p", [{ id: "T1", done: false }, { id: "T2", done: true }]);
-    s.updateTask("p", "T1", { status: "running", agent: "codex", attempts: 1, decisions: ["uses ESM"], orchestrated: true });
+    expect(s.task("p", "T1")?.status).toBe("queued");
+    s.updateTask("p", "T1", { status: "working", agent: "codex", attempts: 1, decisions: ["uses ESM"], orchestrated: true, phaseStartedAt: "2026-10-22T10:00:00Z" });
     s.syncTasks("p", [{ id: "T1", done: false }]);
-    expect(s.task("p", "T1")).toMatchObject({ status: "running", agent: "codex", attempts: 1, decisions: ["uses ESM"], orchestrated: true, note: null });
+    expect(s.task("p", "T1")).toMatchObject({ status: "working", agent: "codex", attempts: 1, decisions: ["uses ESM"], orchestrated: true, note: null,
+      phaseStartedAt: "2026-10-22T10:00:00Z", turnStartedAt: null });
     expect(s.task("p", "T2")?.status).toBe("done");
     s.saveSession({ planId: "p", agent: "codex", sessionId: "t-1", contextTokens: 5000, turns: 1 });
     expect(s.session("p", "codex")?.sessionId).toBe("t-1");

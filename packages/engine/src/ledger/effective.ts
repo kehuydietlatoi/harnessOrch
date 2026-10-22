@@ -37,12 +37,13 @@ export function addUsage(a: TurnUsage, b: TurnUsage): TurnUsage {
  * usage per request; OpenCode per step; Codex only at turn end (so a Codex
  * turn can only be stopped by its timeout).
  */
-export function budgetWatcher(agent: string, limit: number, w: CacheWeights = DEFAULT_WEIGHTS): (line: string) => string | undefined {
+export function budgetWatcher(agent: string, limit: number, w: CacheWeights = DEFAULT_WEIGHTS): BudgetWatcher {
   // Claude streams one "assistant" event per content block (thinking, text, each tool call),
   // all repeating the same request's usage: count each request once, by message id.
   const perRequest = new Map<string, number>();
   let steps = 0;
-  return (line) => {
+  let spent = 0;
+  const watch = (line: string): string | undefined => {
     if (!line.startsWith("{")) return undefined;
     let e: Record<string, unknown>;
     try { e = JSON.parse(line) as Record<string, unknown>; } catch { return undefined; }
@@ -60,10 +61,14 @@ export function budgetWatcher(agent: string, limit: number, w: CacheWeights = DE
     }
     if (!u) return undefined;
     perRequest.set(id ?? `step-${steps++}`, effectiveTokens(usageFrom(u), w));
-    const spent = [...perRequest.values()].reduce((a, b) => a + b, 0);
+    spent = [...perRequest.values()].reduce((a, b) => a + b, 0);
     return spent > limit ? `token budget exceeded (${spent} > ${limit} effective tokens)` : undefined;
   };
+  return Object.defineProperty(watch, "spent", { get: () => spent }) as BudgetWatcher;
 }
+
+/** A line handler that returns a kill reason, plus the effective tokens it has counted so far. */
+export type BudgetWatcher = ((line: string) => string | undefined) & { readonly spent: number };
 
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 function usageFrom(u: Record<string, unknown>): { input: number; cacheRead: number; cacheWrite: number; output: number } {

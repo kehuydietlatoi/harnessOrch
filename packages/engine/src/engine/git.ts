@@ -125,6 +125,24 @@ export async function findStash(cwd: string, label: string): Promise<string | nu
   return null;
 }
 
+/** Drop the newest stash whose message is exactly `label`; false when there was none. */
+export async function dropStash(cwd: string, label: string): Promise<boolean> {
+  const r = await tryGit(cwd, ["stash", "list", "--format=%gd %gs"]);
+  for (const line of r.stdout.split(/\r?\n/)) {
+    const space = line.indexOf(" ");
+    if (space > 0 && line.slice(space + 1).endsWith(`: ${label}`)) {
+      await git(cwd, ["stash", "drop", "-q", line.slice(0, space)]);
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Is `commit` reachable from `ref`? */
+export async function isAncestor(cwd: string, commit: string, ref: string): Promise<boolean> {
+  return (await tryGit(cwd, ["merge-base", "--is-ancestor", commit, ref])).code === 0;
+}
+
 /** Re-apply parked work; on conflict leave the tree clean and report false. The stash entry is kept. */
 export async function applyStash(cwd: string, sha: string): Promise<boolean> {
   if ((await tryGit(cwd, ["stash", "apply", "-q", sha])).code === 0) return true;

@@ -58,6 +58,8 @@ export interface TurnRequest {
   onLine?: (line: string) => void;
   /** Extra kill switch, e.g. a live budget watcher. */
   abortOn?: (line: string) => string | undefined;
+  /** The user stopped the task: kill the turn's process tree at once. */
+  signal?: AbortSignal;
 }
 
 export interface TurnResult {
@@ -323,7 +325,7 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       };
     }
     const proc = await streamProcess(cmd, args, {
-      cwd: req.cwd, env, input: req.prompt, timeoutMs: req.timeoutMs, logFile: req.logFile, onLine: req.onLine, abortOn: abort,
+      cwd: req.cwd, env, input: req.prompt, timeoutMs: req.timeoutMs, logFile: req.logFile, onLine: req.onLine, abortOn: abort, signal: req.signal,
     });
     const raw = readFileSync(req.logFile, "utf8");
     const reduced = req.agent === "claude" ? reduceClaude(raw) : req.agent === "codex" ? reduceCodex(raw, req.resumeSession && req.threadTotals ? { threadId: req.resumeSession, totals: req.threadTotals } : undefined) : reduceOpencodeTurn(raw);

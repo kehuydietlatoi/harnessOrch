@@ -50,7 +50,9 @@ header.top { display: flex; align-items: center; gap: 10px; padding: 8px 14px; b
 .status-pill.running { color: var(--accent); }
 .status-pill.paused { color: var(--warn); }
 .status-pill.ready, .status-pill.merged, .status-pill.done { color: var(--ok); }
-.status-pill.pending { color: var(--muted); }
+.status-pill.pending, .status-pill.queued { color: var(--muted); }
+.status-pill.needs-you { color: var(--warn); }
+.status-pill.skipped { color: var(--muted); }
 
 /* status strip */
 .strip { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--bg); flex-wrap: wrap; }
@@ -89,7 +91,7 @@ main.with-panel { grid-template-columns: minmax(0, 1fr) minmax(380px, 34%); }
 .board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 12px; min-height: 0; overflow: hidden; }
 .column { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; min-height: 0; }
 .column h3 { margin: 0; padding: 10px 12px 8px; font-size: 11.5px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); display: flex; justify-content: space-between; }
-.column.paused h3 { color: var(--warn); }
+.column.paused h3, .column.needs-you h3 { color: var(--warn); }
 .column.running h3 { color: var(--accent); }
 .column.done h3 { color: var(--ok); }
 .count { background: var(--panel-2); border-radius: 99px; padding: 0 7px; font-size: 11px; color: var(--muted); }
@@ -135,6 +137,16 @@ ul.plain { margin: 0; padding-left: 16px; }
 ul.plain li { margin: 2px 0; }
 .resume-box { margin: 0 14px 10px; padding: 10px 12px; border: 1px solid #5a4a1c; background: #241f12; border-radius: 8px; }
 .resume-title { color: var(--warn); font-weight: 600; margin-bottom: 4px; }
+.next { margin: 4px 0 0; font-size: 11px; color: var(--muted); }
+.badge.state-waiting, .badge.state-stopped, .badge.state-interrupted { color: var(--warn); }
+.muted.small { font-size: 12px; margin: 4px 0 0; }
+.stop-row { display: flex; align-items: center; gap: 8px; margin: 0 14px 10px; }
+.stop-row .muted { flex: 1; margin: 0; }
+.confirm-box { margin: 0 14px 10px; padding: 10px 12px; border: 1px solid #5a2a2a; background: #241414; border-radius: 8px; }
+.confirm-box.wide { margin: 0 0 8px; }
+.confirm-title { color: var(--err); font-weight: 600; margin-bottom: 4px; }
+.confirm-box .facts li { font-size: 12px; margin: 2px 0; }
+button.danger { color: var(--err); border-color: #5a2a2a; }
 .resume-box textarea { margin-top: 8px; }
 
 table.runs { width: 100%; border-collapse: collapse; font-size: 12px; }

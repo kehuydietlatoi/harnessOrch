@@ -5,6 +5,7 @@ import { parseArgs } from "node:util";
 import pc from "picocolors";
 import { DEFAULT_CONFIG, type EngineConfig } from "./config.js";
 import { AGENT_IDS, type AgentId } from "./agents/turn.js";
+import { IN_FLIGHT, NEEDS_YOU } from "./engine/lifecycle.js";
 import { PlanRunner, type RunnerEvent } from "./engine/runner.js";
 import { cacheHitRate } from "./ledger/effective.js";
 import { orchHome } from "./ledger/telemetry.js";
@@ -46,8 +47,9 @@ function printStatus(runner: PlanRunner): void {
   const snap = runner.snapshot();
   console.log(pc.bold(`${snap.title} — ${snap.status ?? "not started"}`));
   for (const t of snap.tasks) {
-    const icon = t.status === "done" ? pc.green("✓") : t.status === "paused" ? pc.yellow("⏸") : t.status === "running" ? pc.cyan("▶") : "·";
-    console.log(`  ${icon} ${t.id.padEnd(6)} ${t.title.padEnd(40)} ${pc.dim(`${t.assigned ?? "?"}${t.attempts ? `, attempt ${t.attempts}` : ""}`)}${t.note ? pc.yellow(`  ${t.note}`) : ""}`);
+    const icon = t.status === "done" || t.status === "skipped" ? pc.green("✓") : NEEDS_YOU.includes(t.status) ? pc.yellow("⏸")
+      : IN_FLIGHT.includes(t.status) ? pc.cyan("▶") : "·";
+    console.log(`  ${icon} ${t.id.padEnd(6)} ${t.title.padEnd(40)} ${pc.dim(`${t.status}, ${t.assigned ?? "?"}${t.attempts ? `, attempt ${t.attempts}` : ""}`)}${t.note ? pc.yellow(`  ${t.note}`) : ""}`);
   }
   const runs = runner.store.runs(runner.key);
   if (!runs.length) return;

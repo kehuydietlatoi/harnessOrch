@@ -2,7 +2,7 @@ import { createWriteStream } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { spawnRun } from "./process-group.js";
-import { killProcessTree, type SpawnResult } from "./spawn.js";
+import { killProcessTree, STOPPED_BY_YOU, type SpawnResult } from "./spawn.js";
 import { resolveWindowsCommand, windowsInvocation } from "./win-command.js";
 import { log as diagnostics } from "./log.js";
 
@@ -17,6 +17,8 @@ export interface StreamOptions {
   onLine?: (line: string) => void;
   /** Return a reason to kill the whole process tree at once (budget overrun, sub-agent fan-out). */
   abortOn?: (line: string) => string | undefined;
+  /** The user stopped the run: kill the whole process tree at once. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -62,6 +64,13 @@ export function streamProcess(cmd: string, args: string[], opts: StreamOptions):
       aborted = reason;
       killProcessTree(child);
     };
+    const onAbort = (): void => {
+      if (aborted !== undefined) return;
+      aborted = STOPPED_BY_YOU;
+      killProcessTree(child);
+    };
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout?.on("data", onStdout);
     child.stderr?.on("data", (d: Buffer) => logStream?.write(d));
 
@@ -73,6 +82,7 @@ export function streamProcess(cmd: string, args: string[], opts: StreamOptions):
       if (finished) return;
       finished = true;
       if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
       if (pending) handleLine(pending);
       const done = (): void => resolve({
         code: timedOut ? 124 : aborted !== undefined ? 125 : code,

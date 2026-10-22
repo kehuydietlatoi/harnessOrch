@@ -32,6 +32,9 @@ export function killProcessTree(child: ChildProcess): void {
   child.kill("SIGKILL");
 }
 
+/** The abort reason a run reports when its AbortSignal fired. */
+export const STOPPED_BY_YOU = "stopped by you";
+
 export interface SpawnResult {
   code: number; // 124 = timed out, 125 = aborted by `abortOn`, 127 = failed to start
   durationMs: number;
@@ -62,6 +65,8 @@ export function spawnLogged(
      * For failure modes a timeout only catches late (e.g. a harness idling on its own sub-agents).
      */
     abortOn?: (line: string) => string | undefined;
+    /** Kill the child's whole process tree when this fires. */
+    signal?: AbortSignal;
   } = {},
 ): Promise<SpawnResult> {
   return new Promise((resolve) => {
@@ -106,6 +111,13 @@ export function spawnLogged(
         }
       };
     };
+    const onAbort = (): void => {
+      if (aborted !== undefined) return;
+      aborted = STOPPED_BY_YOU;
+      killProcessTree(child);
+    };
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener("abort", onAbort, { once: true });
     const onOut = watch();
     const onErr = watch();
     child.stdout?.on("data", (d: Buffer) => {
@@ -130,6 +142,7 @@ export function spawnLogged(
       if (finished) return;
       finished = true;
       if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
       const done = (): void =>
         resolve({
           code: timedOut ? 124 : aborted !== undefined ? 125 : code,
