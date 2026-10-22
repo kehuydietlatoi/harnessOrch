@@ -11,7 +11,7 @@ describe("skills library", () => {
     expect(library.map((s) => `${s.group}/${s.name}`).sort()).toEqual([
       "core/fixer/diagnosing-bugs", "core/fixer/fix-root-causes", "core/implementer/tdd",
       "core/reviewer/blast-radius", "core/reviewer/test-behavior-not-implementation",
-      "project/game/game-dev-loop", "project/typescript/typescript-best-practices",
+      "project/game/game-dev-loop", "project/game/sprite-assets", "project/typescript/typescript-best-practices",
     ]);
   });
 
