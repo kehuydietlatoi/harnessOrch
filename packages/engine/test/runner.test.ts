@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { TurnRequest, TurnResult } from "../src/agents/turn.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
-import { PlanRunner, type RunnerEvent } from "../src/engine/runner.js";
+import { PlanRunner, type RunnerDeps, type RunnerEvent } from "../src/engine/runner.js";
 import { Store } from "../src/store/store.js";
 
 const PASS = 'node -e "process.exit(0)"';
@@ -87,9 +87,9 @@ const done = (summary = "did it") => ({ structured: { status: "done", summary, f
 const approve = { structured: { decision: "approve", notes: "", followups: [] } };
 const taskId = (prompt: string): string | undefined => /# Task (\S+):|Task (\S+) is not done yet/.exec(prompt)?.slice(1).find(Boolean);
 
-function runner(planFile: string, runTurn: (r: TurnRequest) => Promise<TurnResult>, events: RunnerEvent[] = []) {
+function runner(planFile: string, runTurn: (r: TurnRequest) => Promise<TurnResult>, events: RunnerEvent[] = [], deps: Partial<RunnerDeps> = {}) {
   const r = new PlanRunner({ repo, planFile, store, config: { ...DEFAULT_CONFIG, maxAttempts: 2 }, worktreeRoot: join(root, "wt"),
-    skillsRoot: join(root, "no-skills"), deps: { runTurn, sleep: async () => undefined, installDeps: async (cwd) => { installs.push(cwd); return { ok: true, output: "" }; } } });
+    skillsRoot: join(root, "no-skills"), deps: { runTurn, sleep: async () => undefined, installDeps: async (cwd) => { installs.push(cwd); return { ok: true, output: "" }; }, ...deps } });
   r.on("event", (e: RunnerEvent) => { if (e.type !== "line") events.push(e); });
   return r;
 }
@@ -271,7 +271,14 @@ write_scope: [src/T1.txt]`));
       }
       return { ...done(), write: { "src/T1.txt": req.prompt.includes("reviewer requested changes") ? "x\n" : "x" } };
     });
-    expect(await runner(plan, runTurn).run()).toBe("ready");
+    const r = runner(plan, runTurn);
+    const states: string[] = [];
+    r.on("event", () => { const s = r.reviewStates()[0]?.state; if (s && s !== states.at(-1)) states.push(s); });
+    expect(await r.run()).toBe("ready");
+    // The board sees the fix as running work, never as something that needs you.
+    expect(states).toEqual(expect.arrayContaining(["reviewing", "fixing"]));
+    expect(states).not.toContain("needs-you");
+    expect(r.reviewStates()).toEqual([{ agent: "codex", state: "approved", reviewer: "claude", round: 2, why: null, tasks: ["T1"] }]);
     expect(store.reviews(KEY(), "codex").map((r) => r.decision)).toEqual(["request-changes", "approve"]);
     const fix = calls.find((c) => c.prompt.includes("reviewer requested changes"))!;
     expect(fix.resumeSession).toBe("codex-session-1");
@@ -614,6 +621,58 @@ setInterval(() => { if (f.existsSync(${JSON.stringify(gate)})) process.exit(${ou
     expect(sh(repo, "show", "harness/demo:src/T1.txt")).toBe("half");
   });
 
+  it("runs setup once when Resume and Start race, so recovery never touches a task it already started", async () => {
+    // Stale dependencies make setup slow (it installs), which is the window the live race hit.
+    writeFileSync(join(repo, ".gitignore"), "node_modules/\n");
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "g", devDependencies: { dep: "1.0.0" } }));
+    writeFileSync(join(repo, "package-lock.json"), JSON.stringify({ lockfileVersion: 3, packages: { "": {}, "node_modules/dep": { version: "1.0.0" } } }));
+    sh(repo, "add", "-A");
+    sh(repo, "commit", "-q", "-m", "deps");
+    const plan = writePlan(task("T1", "Cut off", `agent: claude\ngoal: g\nwrite_scope: [src/T1.txt, src/T1b.txt]`));
+    const first = fakeTurns((req) => {
+      writeFileSync(join(req.cwd, "src", "T1.txt"), "half");
+      return new Promise<Reply>(() => undefined);
+    });
+    void runner(plan, first.runTurn).run();
+    await expect.poll(() => first.calls.length, { timeout: 30_000 }).toBe(1);
+
+    // The app reopens. Resume (which prepares) and Start (which runs) are pressed while setup installs.
+    const events: RunnerEvent[] = [];
+    let restored: string | null = null;
+    const second = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      restored ??= existsSync(join(req.cwd, "src", "T1.txt")) ? readFileSync(join(req.cwd, "src", "T1.txt"), "utf8") : "";
+      return { ...done(), write: { "src/T1b.txt": "rest" } };
+    });
+    const slowInstall = async (cwd: string): Promise<{ ok: boolean; output: string }> => {
+      installs.push(cwd);
+      await new Promise((res) => setTimeout(res, 300));
+      return { ok: true, output: "" };
+    };
+    const r = runner(plan, second.runTurn, events, { installDeps: slowInstall });
+    const resumeClick = r.prepare();
+    const startClick = r.run();
+    await resumeClick;
+    expect(await startClick).toBe("ready");
+    const t1 = events.filter((e) => e.type === "task" && e.taskId === "T1").map((e) => (e as { status: string }).status);
+    // Interrupted once by recovery, then continued; never re-interrupted while running.
+    expect(t1.filter((s) => s === "interrupted")).toHaveLength(1);
+    expect(t1.indexOf("interrupted")).toBeLessThan(t1.indexOf("working"));
+    expect(second.calls.filter((c) => !c.prompt.startsWith("Review the changes"))).toHaveLength(1);
+    expect(restored).toBe("half");
+  });
+
+  it("an engine error parks the task's edits so Resume restores them", async () => {
+    const plan = writePlan(task("T1", "Crashes", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const { runTurn } = fakeTurns((req) => {
+      writeFileSync(join(req.cwd, "src", "T1.txt"), "latest");
+      throw new Error("boom");
+    });
+    expect(await runner(plan, runTurn).run()).toBe("paused");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "waiting", note: "engine error: boom" });
+    expect(sh(join(root, "wt", "codex"), "stash", "list", "--format=%gs")).toContain("harnessOrch demo T1 (paused)");
+  });
+
   it("Stop all stops every task in flight and dispatches nothing new", async () => {
     const plan = writePlan([
       task("T1", "One", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`),
@@ -629,6 +688,48 @@ setInterval(() => { if (f.existsSync(${JSON.stringify(gate)})) process.exit(${ou
     await expect.poll(() => [store.task(KEY(), "T1")?.status, store.task(KEY(), "T2")?.status], { timeout: 30_000 }).toEqual(["stopped", "stopped"]);
     expect(store.task(KEY(), "T3")?.status).toBe("queued");
     expect(calls).toHaveLength(2);
+  });
+
+  it("after the app closes mid review-fix, redoes the fix before reviewing again", async () => {
+    const plan = writePlan(task("T1", "Reviewed", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    // The first app session: the review rejects, and the fix turn dies with the app.
+    const first = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return { structured: { decision: "request-changes", notes: "add a newline", followups: [] } };
+      if (req.prompt.includes("reviewer requested changes")) return new Promise<Reply>(() => undefined);
+      return { ...done(), write: { "src/T1.txt": "x" } };
+    });
+    void runner(plan, first.runTurn).run();
+    await expect.poll(() => first.calls.some((c) => c.prompt.includes("reviewer requested changes")), { timeout: 30_000 }).toBe(true);
+
+    const second = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      return { ...done(), write: { "src/T1.txt": "x\n" } };
+    });
+    expect(await runner(plan, second.runTurn).run()).toBe("ready");
+    const kinds = second.calls.map((c) => (c.prompt.startsWith("Review the changes") ? "review" : c.prompt.includes("reviewer requested changes") ? "fix" : "other"));
+    expect(kinds).toEqual(["fix", "review"]);
+    expect(store.reviews(KEY(), "codex").map((r) => [r.round, r.decision])).toEqual([[1, "request-changes"], [2, "approve"]]);
+  });
+
+  it("sends a task's chosen model and thinking level to its agent", async () => {
+    const plan = writePlan([
+      task("T1", "Picked", `agent: claude\nmodel: claude-sonnet-5-5\neffort: low\ngoal: g\nwrite_scope: [src/T1.txt]`),
+      task("T2", "Routed", `role: hard\neffort: max\ngoal: g\nwrite_scope: [src/T2.txt]`),
+    ].join("\n"));
+    const { calls, runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      const id = taskId(req.prompt)!;
+      return { ...done(), write: { [`src/${id}.txt`]: id } };
+    });
+    const r = runner(plan, runTurn);
+    r.load();
+    // The board shows what each task will run on before it starts.
+    expect(r.snapshot().tasks.map((t) => [t.id, t.routedModel, t.routedEffort])).toEqual([["T1", "claude-sonnet-5-5", "low"], ["T2", "claude-opus-5-5", "max"]]);
+    expect(await r.run()).toBe("ready");
+    const brief = (id: string) => calls.find((c) => c.prompt.startsWith(`# Task ${id}`))!.model;
+    expect(brief("T1")).toMatchObject({ agent: "claude", model: "claude-sonnet-5-5", effort: "low" });
+    expect(brief("T2")).toMatchObject({ agent: "claude", model: "claude-opus-5-5", effort: "max" });
+    expect(r.snapshot().modelChoices.claude).toEqual(expect.arrayContaining(["claude-opus-5-5", "claude-sonnet-5-5"]));
   });
 
   it("refuses to start an invalid plan", async () => {

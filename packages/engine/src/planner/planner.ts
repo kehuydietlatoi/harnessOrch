@@ -58,7 +58,7 @@ skills: []            # optional project skills
 - **checks** are shell commands the engine runs itself; every task needs at least one, or rely on the plan-level checks.
 - **depends_on** only when a task truly needs another's result.
 - **role** picks the agent: \`implement\` → ${route(cfg.routing.implement)}; \`small\` (renames, config, docs, boilerplate, simple tests) → ${route(cfg.routing.small)}; \`hard\` (tricky bugs, core algorithms, risky refactors) → ${route(cfg.routing.hard)}. Claude time is scarce: use \`hard\` sparingly.
-- Add \`agent: claude|codex|opencode\` only when the user asks for a specific agent.
+- Add \`agent: claude|codex|opencode\` (and optionally \`model:\`) only when the user asks for a specific agent or model. \`effort: low|medium|high|xhigh|max\` sets the thinking level; leave it out unless the user asks.
 - Set \`images: true\` on asset tasks that need image generation (Codex).
 - **skills**: name at most 2 project skills that fit, in the header (whole plan) or on a task. Available:
 - ${skillList}

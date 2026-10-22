@@ -167,15 +167,26 @@ export class PlanRunner extends EventEmitter {
     return { plan, errors: [...errors, ...v.errors], warnings: v.warnings };
   }
 
+  /** Set up once per process; true after setUp() finished. */
+  private prepared = false;
+  private preparing: Promise<void> | null = null;
+
   /** Create the plan branch and its integration worktree; register the plan. */
   async prepare(): Promise<void> {
     const { errors } = this.load();
     if (errors.length) throw new Error(`plan is invalid:\n- ${errors.join("\n- ")}`);
     // Already prepared (e.g. a Resume click mid-run): pick up new tasks, never touch work in flight.
-    if (this.planBranch) {
+    if (this.prepared) {
       this.store.syncTasks(this.key, this.plan.tasks);
       return;
     }
+    // Setup takes seconds (worktrees, installs). A second caller, such as Start pressed during a Resume,
+    // waits for the same setup instead of running ahead and dispatching before recovery has run.
+    this.preparing ??= this.setUp().finally(() => { this.preparing = null; });
+    await this.preparing;
+  }
+
+  private async setUp(): Promise<void> {
     this.baseBranch = this.plan.header.baseBranch ?? (await g.currentBranch(this.repo));
     this.planBranch = `harness/${this.id}`;
     this.planWorktree = join(this.wtRoot, "plan");
@@ -190,12 +201,24 @@ export class PlanRunner extends EventEmitter {
     for (const row of this.store.tasks(this.key)) {
       if (IN_FLIGHT.includes(row.status) || (row.status === "interrupted" && row.note === null)) await this.recover(row);
     }
+    // A rejected review whose fix never landed (the app closed mid-fix) goes back to the fix,
+    // instead of re-reviewing unchanged work and burning a round. Each fixed round leaves one fix commit.
+    for (const agent of this.authors()) {
+      const rounds = this.store.reviews(this.key, agent);
+      if (rounds.at(-1)?.decision !== "request-changes") continue;
+      const rejected = rounds.filter((r) => r.decision === "request-changes").length;
+      const subject = `Review fixes (${agent})`;
+      const log = await g.tryGit(this.repo, ["log", this.planBranch, "--format=%s", "--fixed-strings", `--grep=${subject}`]);
+      if (log.stdout.split(/\r?\n/).filter((s) => s === subject).length < rejected) this.fixFirst.add(agent);
+    }
+    this.prepared = true;
   }
 
   /** A task the last app session left in flight: keep its edits, say what it was doing, and mark it interrupted. */
   private async recover(row: TaskRow): Promise<void> {
     const t = this.plan.tasks.find((x) => x.id === row.id);
-    if (!t) return;
+    // Work this process is running is not left over from a dead one.
+    if (!t || this.controllers.has(t.id) || this.inflight.has(`task:${t.id}`)) return;
     const lanePath = row.agent ? join(this.wtRoot, row.agent) : null;
     const lane = lanePath && existsSync(lanePath) ? lanePath : null;
     if (row.status === "merging" && lane) {
@@ -287,7 +310,7 @@ ${r.output}` });
   }
 
   private async loop(): Promise<PlanStatus> {
-    if (!this.planBranch) await this.prepare();
+    if (!this.prepared) await this.prepare();
     this.stopped = false;
     // Start continues tasks the app closed on, like Resume: same session, edits restored.
     for (const row of this.store.tasks(this.key)) if (row.status === "interrupted") this.resumeTask(row.id);
@@ -365,11 +388,16 @@ ${r.output}` });
   private track(agent: string, key: string, work: Promise<void>): void {
     this.busy.add(agent);
     this.doing.set(agent, key.startsWith("task:") ? key.slice(5) : "review");
-    const p = work.catch((error: unknown) => {
+    const p = work.catch(async (error: unknown) => {
       this.say({ type: "info", message: `${key} crashed: ${error instanceof Error ? error.message : String(error)}` });
       const taskId = key.startsWith("task:") ? key.slice(5) : null;
       const state = taskId ? this.store.task(this.key, taskId)?.status : undefined;
-      if (taskId && state && canTransition(state, "error")) this.pause(taskId, "error", `engine error: ${error instanceof Error ? error.message : String(error)}`);
+      if (!taskId || !state || !canTransition(state, "error")) return;
+      // Keep the agent's latest edits where Resume looks for them, not as a nameless leftover.
+      const t = this.plan.tasks.find((x) => x.id === taskId);
+      const lane = join(this.wtRoot, agent);
+      if (t && existsSync(lane)) await g.stashWip(lane, this.parkLabel(t)).catch(() => false);
+      this.pause(taskId, "error", `engine error: ${error instanceof Error ? error.message : String(error)}`);
     }).finally(() => {
       this.inflight.delete(key);
       this.busy.delete(agent);
@@ -386,13 +414,22 @@ ${r.output}` });
 
   /** Ordered agent choices for a task: reassignment, explicit override, then the role's routing. */
   candidates(t: PlanTask): AgentRef[] {
+    const effort = t.effort ? { effort: t.effort } : {};
     const re = this.reassigned.get(t.id);
-    if (re) return [re];
+    if (re) return [{ ...re, ...effort }];
     if (t.agent) {
       const routed = [...this.cfg.routing[t.role], ...this.cfg.routing.implement, ...this.cfg.routing.hard].find((r) => r.agent === t.agent);
-      return [{ ...(routed ?? { agent: t.agent }), ...(t.model ? { model: t.model } : {}) }];
+      return [{ ...(routed ?? { agent: t.agent }), ...(t.model ? { model: t.model } : {}), ...effort }];
     }
-    return this.cfg.routing[t.role];
+    return this.cfg.routing[t.role].map((r) => ({ ...r, ...effort }));
+  }
+
+  /** Models the config knows per agent: the board's suggestions for a task's model. */
+  private modelChoices(): Record<string, string[]> {
+    const refs = [...Object.values(this.cfg.routing).flat(), ...Object.values(this.cfg.reviewers).flat()];
+    const out: Record<string, string[]> = {};
+    for (const r of refs) if (r.model && !(out[r.agent] ??= []).includes(r.model)) out[r.agent].push(r.model);
+    return out;
   }
 
   private schedTasks(): SchedTask[] {
@@ -997,15 +1034,32 @@ ${r.output}` });
 
   private readonly reviewBlocked = new Set<string>();
   private readonly reviewFailures = new Map<string, number>();
+  /** Why each blocked review needs you. */
+  private readonly reviewWhy = new Map<string, string>();
+  /** What an author's review is doing right now. */
+  private readonly reviewPhase = new Map<string, "reviewing" | "fixing">();
+
+  /** Each author's review as the board shows it: running (reviewing or fixing), needing you, approved or not yet run. */
+  reviewStates(): Array<{ agent: string; state: "reviewing" | "fixing" | "needs-you" | "approved" | "pending"; reviewer: string | null; round: number; why: string | null; tasks: string[] }> {
+    return this.authors().map((agent) => {
+      const last = this.store.reviews(this.key, agent).at(-1);
+      const phase = this.inflight.has(`review:${agent}`) ? this.reviewPhase.get(agent) : undefined;
+      const state = phase ?? (this.reviewBlocked.has(agent) ? "needs-you" : this.reviewState(agent) === "approved" ? "approved" : "pending");
+      const tasks = this.store.tasks(this.key).filter((r) => r.agent === agent && r.status === "done" && r.commitSha).map((r) => r.id);
+      return { agent, state, reviewer: last?.reviewer ?? null, round: last?.round ?? 0, why: this.reviewWhy.get(agent) ?? null, tasks };
+    });
+  }
 
   private blockReview(agent: string, why: string): void {
     this.reviewBlocked.add(agent);
+    this.reviewWhy.set(agent, why);
     this.say({ type: "needs-you", message: `review of ${agent}'s work needs you: ${why}` });
   }
 
   /** The human looked at a blocked review: approve as-is or let the engine review again. */
   resolveReview(agent: string, action: "approve" | "retry"): void {
     this.reviewBlocked.delete(agent);
+    this.reviewWhy.delete(agent);
     this.reviewFailures.delete(agent);
     if (action === "approve") {
       const round = (this.store.reviews(this.key, agent).at(-1)?.round ?? 0) + 1;
@@ -1041,6 +1095,7 @@ ${r.output}` });
     }
     const reviewer = this.reviewerFor(author);
     if (!reviewer) return;
+    this.reviewPhase.set(author, "reviewing");
     const { diff } = await g.commitsDiff(this.planWorktree, rows.flatMap((r) => this.commitsOf(r.id)).concat(this.fixCommits.get(author) ?? []));
     this.say({ type: "info", message: `${reviewer.agent} is reviewing ${author}'s work (round ${round})` });
     const r = await this.turn(reviewer, { cwd: this.planWorktree, prompt: renderReviewPrompt(author, tasks, diff, reviewer.agent === "opencode", this.skillPaths("reviewer", [])),
@@ -1064,6 +1119,8 @@ ${r.output}` });
 
   /** Fix review findings in the author's own lane session, then re-review. */
   private async reviewFix(agent: AgentId, tasks: PlanTask[], notes: string): Promise<void> {
+    this.reviewPhase.set(agent, "fixing");
+    this.say({ type: "info", message: `${agent} is fixing the review findings on ${tasks.map((t) => t.id).join(", ")}` });
     const lane = await this.lane(agent);
     await this.syncLaneDeps(lane);
     const synthetic: PlanTask = {
@@ -1092,7 +1149,7 @@ ${r.output}` });
 
   /** One click: merge the plan branch into the base branch in the main checkout. */
   async mergeToBase(): Promise<string> {
-    if (!this.planBranch) await this.prepare();
+    if (!this.prepared) await this.prepare();
     if (!this.readyToMerge()) throw new Error("plan is not ready: tasks or reviews are still open");
     const branch = await g.currentBranch(this.repo);
     if (branch !== this.baseBranch) throw new Error(`main checkout is on ${branch}; switch to ${this.baseBranch} first`);
@@ -1137,11 +1194,15 @@ ${r.output}` });
       tasks: (this.plan?.tasks ?? []).map((t) => {
         const r = rows.get(t.id);
         const status: TaskState = r?.status ?? (t.done ? "done" : "queued");
-        return { ...t, status, next: STATE_INFO[status].next, phaseStartedAt: r?.phaseStartedAt ?? null, assigned: r?.agent ?? this.candidates(t)[0]?.agent ?? null,
+        const route = this.candidates(t)[0];
+        return { ...t, status, next: STATE_INFO[status].next, phaseStartedAt: r?.phaseStartedAt ?? null,
+          routedModel: r?.model ?? route?.model ?? null, routedEffort: route?.effort ?? null, assigned: r?.agent ?? this.candidates(t)[0]?.agent ?? null,
           note: r?.note ?? null, attempts: r?.attempts ?? 0, summary: r?.summary ?? null, decisions: r?.decisions ?? [], commits: this.commitsOf(t.id) };
       }),
       runs,
       agentStates: this.agentStates(),
+      reviewStates: this.plan ? this.reviewStates() : [],
+      modelChoices: this.modelChoices(),
       effective,
     };
   }

@@ -44,6 +44,10 @@ export interface TaskView {
   role: "implement" | "small" | "hard";
   agent?: string;
   model?: string;
+  effort?: string;
+  /** What it runs (or will run) on: the task's override, else its routing's first choice. */
+  routedModel: string | null;
+  routedEffort: string | null;
   dependsOn: string[];
   goal: string;
   doneWhen: string[];
@@ -88,6 +92,18 @@ export interface RunView {
   usage: { input: number; cacheRead: number; cacheWrite: number; output: number; requests: number; contextTokens: number };
 }
 
+/** One author's review: running (reviewing or fixing), needing you, approved or not yet run. */
+export interface ReviewState {
+  agent: string;
+  state: "reviewing" | "fixing" | "needs-you" | "approved" | "pending";
+  reviewer: string | null;
+  round: number;
+  why: string | null;
+  tasks: string[];
+}
+
+export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+
 export interface EventView { id: number; ts: string; type: string; data: Record<string, unknown> }
 
 export interface Snapshot {
@@ -104,6 +120,9 @@ export interface Snapshot {
   runs: RunView[];
   startedAt: string | null;
   reviews: Array<{ agent: string; round: number; reviewer: string; decision: "approve" | "request-changes"; notes: string }>;
+  reviewStates: ReviewState[];
+  /** Models the engine config knows, per agent. */
+  modelChoices: Record<string, string[]>;
   events: EventView[];
 }
 

@@ -77,7 +77,9 @@ export function App() {
 
   const status = snap?.status ?? "not started";
   const latestReview = (snap?.reviews ?? []).filter((r, _i, all) => !all.some((x) => x.agent === r.agent && x.round > r.round));
-  const blockedReviews = latestReview.filter((r) => r.decision === "request-changes");
+  // Only a review the engine stopped on needs you; a rejected one it is already fixing is running work.
+  const reviewStates = new Map((snap?.reviewStates ?? []).map((r) => [r.agent, r]));
+  const blockedReviews = latestReview.filter((r) => reviewStates.get(r.agent)?.state === "needs-you");
   const task = snap?.tasks.find((t) => t.id === selected) ?? null;
   const reviewAgent = selected?.startsWith("review:") ? selected.slice(7) : null;
   const events: EventView[] = snap?.events ?? [];

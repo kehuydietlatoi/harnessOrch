@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ActivityList } from "./Activity";
 import { DiffView } from "./Diff";
-import { AGENTS, api, fmtDuration, fmtTime, fmtTokens, groupOf, NEEDS_YOU, prefs, STOPPABLE, type Snapshot, type StopInfo, type TaskView } from "./api";
+import { AGENTS, EFFORTS, api, fmtDuration, fmtTime, fmtTokens, groupOf, NEEDS_YOU, prefs, STOPPABLE, type Snapshot, type StopInfo, type TaskView } from "./api";
 
 type Tab = "overview" | "activity" | "diff" | "tokens";
 
@@ -66,6 +66,17 @@ export function TaskPanel(props: {
                 {AGENTS.map((a) => <option key={a} value={a}>{a}</option>)}
               </select>
               {t.status !== "queued" && <span className="muted"> locked while {t.status}</span>}
+            </Field>
+            <Field label="Model">
+              <ModelPicker task={t} choices={props.snap.modelChoices}
+                onSet={(model) => void call(api.call("plan:setField", props.planFile, t.id, "model", model))} />
+            </Field>
+            <Field label="Thinking">
+              <select value={t.effort ?? ""} disabled={t.status !== "queued"}
+                onChange={(e) => void call(api.call("plan:setField", props.planFile, t.id, "effort", e.target.value || null))}>
+                <option value="">{t.routedEffort && !t.effort ? `${t.routedEffort} (routing)` : "agent default"}</option>
+                {EFFORTS.map((x) => <option key={x} value={x}>{x}</option>)}
+              </select>
             </Field>
             <Field label="Goal"><p>{t.goal}</p></Field>
             {t.summary && <Field label="Result"><p>{t.summary}</p></Field>}
@@ -178,6 +189,25 @@ function StopBox(props: { task: TaskView; planFile: string; onStop: () => void; 
         <button className="danger small" disabled={!info.stoppable} onClick={() => { setInfo(null); props.onStop(); }}>Stop task</button>
       </div>
     </div>
+  );
+}
+
+/** A task's model: the config's models for its agent, or any id typed in. Needs an explicit agent. */
+function ModelPicker(props: { task: TaskView; choices: Record<string, string[]>; onSet: (model: string | null) => void }) {
+  const t = props.task;
+  const [draft, setDraft] = useState(t.model ?? "");
+  useEffect(() => { setDraft(t.model ?? ""); }, [t.model]);
+  if (!t.agent) {
+    return <span className="muted">{t.routedModel ?? "agent default"} (routing) · pick an agent above to choose a model</span>;
+  }
+  const listId = `models-${t.id}`;
+  const commit = (): void => { if (draft.trim() !== (t.model ?? "")) props.onSet(draft.trim() || null); };
+  return (
+    <>
+      <input list={listId} value={draft} disabled={t.status !== "queued"} placeholder={t.routedModel ? `${t.routedModel} (routing)` : "agent default"}
+        onChange={(e) => setDraft(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") commit(); }} />
+      <datalist id={listId}>{(props.choices[t.agent] ?? []).map((m) => <option key={m} value={m} />)}</datalist>
+    </>
   );
 }
 

@@ -5,6 +5,9 @@ import { lockPathsOverlap } from "../git/path-locks.js";
 export const TASK_ROLES = ["implement", "small", "hard"] as const;
 export type TaskRole = typeof TASK_ROLES[number];
 
+/** Thinking levels a task may ask for; each CLI receives it as its own effort flag. */
+export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+
 export interface PlanTask {
   id: string;
   title: string;
@@ -13,6 +16,8 @@ export interface PlanTask {
   agent?: string;
   /** Explicit model override for that agent. */
   model?: string;
+  /** Thinking level override (`low` … `max`). */
+  effort?: string;
   dependsOn: string[];
   goal: string;
   /** Plain-language acceptance criteria, for the worker and the reviewer. */
@@ -142,6 +147,7 @@ export function parsePlan(markdown: string): ParseResult {
       id, title: m[4].trim(), role,
       agent: text(fields.agent, "agent", errors, where),
       model: text(fields.model, "model", errors, where),
+      effort: text(fields.effort, "effort", errors, where),
       dependsOn: strings(fields.depends_on, "depends_on", errors, where),
       goal: goal ?? "",
       doneWhen: strings(fields.done_when, "done_when", errors, where),
@@ -190,6 +196,8 @@ export function validatePlan(plan: Plan, opts: ValidationOptions): { errors: str
     for (const d of t.dependsOn) if (!byId.has(d)) errors.push(`${where}: depends on unknown task ${d}`);
     if (dependsOn(byId, t.id, t.id)) errors.push(`${where}: dependency cycle`);
     if (t.agent !== undefined && !opts.agents.includes(t.agent)) errors.push(`${where}: unknown agent ${t.agent} (known: ${opts.agents.join(", ")})`);
+    if (t.effort !== undefined && !(EFFORTS as readonly string[]).includes(t.effort)) errors.push(`${where}: effort must be one of ${EFFORTS.join(", ")}`);
+    if (t.model !== undefined && t.agent === undefined) warnings.push(`${where}: model ${t.model} is ignored without an agent`);
     if (t.writeScope.length === 0) errors.push(`${where}: write_scope is required so parallel agents never collide`);
     if (t.checks.length === 0 && plan.header.checks.length === 0) warnings.push(`${where}: no checks; only the review will verify it`);
     if (t.skills.length > 2) warnings.push(`${where}: more than 2 skills; only the first 2 are injected`);
@@ -213,11 +221,20 @@ export function validatePlan(plan: Plan, opts: ValidationOptions): { errors: str
   return { errors, warnings: [...new Set(warnings)] };
 }
 
-/**
- * Set (or clear, with `undefined`) a task's `agent:` line inside its YAML block,
- * leaving every other byte alone. Used by the board's assignment dropdown.
- */
+/** Set (or clear) a task's `agent:` line. Used by the board's assignment dropdown. */
 export function setTaskAgent(markdown: string, id: string, agent: string | undefined): string {
+  return setTaskField(markdown, id, "agent", agent);
+}
+
+/** The task fields the board may edit. */
+export type EditableField = "agent" | "model" | "effort";
+const FIELD_ORDER: readonly EditableField[] = ["agent", "model", "effort"];
+
+/**
+ * Set (or clear, with `undefined`) one `key:` line inside a task's YAML block,
+ * leaving every other byte alone. A new line goes after `role:` and the routing fields before it.
+ */
+export function setTaskField(markdown: string, id: string, key: EditableField, value: string | undefined): string {
   const eol = markdown.includes("\r\n") ? "\r\n" : "\n";
   const lines = markdown.split(/\r?\n/);
   const start = lines.findIndex((l) => HEADING.exec(l)?.[3] === id);
@@ -229,14 +246,15 @@ export function setTaskAgent(markdown: string, id: string, agent: string | undef
   const close = lines.findIndex((l, i) => i > open && i < next && FENCE.test(l));
   if (close < 0) throw new Error(`task ${id} yaml block is not closed`);
   const indent = FENCE.exec(lines[open])![1];
-  const existing = lines.findIndex((l, i) => i > open && i < close && /^\s*agent\s*:/.test(l));
-  if (agent === undefined) {
+  const lineOf = (k: string): number => lines.findIndex((l, i) => i > open && i < close && new RegExp(`^\\s*${k}\\s*:`).test(l));
+  const existing = lineOf(key);
+  if (value === undefined) {
     if (existing >= 0) lines.splice(existing, 1);
   } else if (existing >= 0) {
-    lines[existing] = lines[existing].replace(/^(\s*agent\s*:\s*)[^#]*?(\s*(#.*)?)$/, `$1${agent}$2`);
+    lines[existing] = lines[existing].replace(new RegExp(`^(\\s*${key}\\s*:\\s*)[^#]*?(\\s*(#.*)?)$`), `$1${value}$2`);
   } else {
-    const role = lines.findIndex((l, i) => i > open && i < close && /^\s*role\s*:/.test(l));
-    lines.splice(role >= 0 ? role + 1 : open + 1, 0, `${indent}agent: ${agent}`);
+    const after = [...FIELD_ORDER.slice(0, FIELD_ORDER.indexOf(key)).reverse(), "role"].map(lineOf).find((i) => i >= 0);
+    lines.splice(after !== undefined ? after + 1 : open + 1, 0, `${indent}${key}: ${value}`);
   }
   return lines.join(eol);
 }

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as pty from "node-pty";
 import {
-  AGENT_IDS, DEFAULT_CONFIG, PlanRunner, Store, planKey, cacheHitRate, orchHome, parsePlan, plannerArgs, setTaskAgent,
+  AGENT_IDS, DEFAULT_CONFIG, PlanRunner, Store, planKey, cacheHitRate, orchHome, parsePlan, plannerArgs, setTaskAgent, setTaskField, type EditableField,
   type AgentId, type RunnerEvent,
 } from "@harnessorch/engine";
 
@@ -197,6 +197,11 @@ handle("plan:restartClean", async (file: string, taskId: string) => {
 });
 handle("plan:setAgent", (file: string, taskId: string, agent: string | null) => {
   writeFileSync(file, setTaskAgent(readFileSync(file, "utf8"), taskId, agent ?? undefined));
+  return true;
+});
+handle("plan:setField", (file: string, taskId: string, key: EditableField, value: string | null) => {
+  if (!["model", "effort"].includes(key)) throw new Error(`cannot edit ${key} here`);
+  writeFileSync(file, setTaskField(readFileSync(file, "utf8"), taskId, key, value?.trim() || undefined));
   return true;
 });
 handle("plan:resume", async (file: string, taskId: string, guidance: string | null, agent: AgentId | null) => {

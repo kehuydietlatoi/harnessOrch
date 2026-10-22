@@ -137,6 +137,10 @@ ul.plain { margin: 0; padding-left: 16px; }
 ul.plain li { margin: 2px 0; }
 .resume-box { margin: 0 14px 10px; padding: 10px 12px; border: 1px solid #5a4a1c; background: #241f12; border-radius: 8px; }
 .resume-title { color: var(--warn); font-weight: 600; margin-bottom: 4px; }
+.info-box { margin: 0 14px 10px; padding: 10px 12px; border: 1px solid #2c3a66; background: #141a2c; border-radius: 8px; }
+.info-title { color: var(--accent); font-weight: 600; margin-bottom: 4px; }
+.card.review.active { border-left-color: var(--accent); cursor: pointer; }
+.field input[list] { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; color: inherit; font: inherit; min-width: 240px; }
 .next { margin: 4px 0 0; font-size: 11px; color: var(--muted); }
 .badge.state-waiting, .badge.state-stopped, .badge.state-interrupted { color: var(--warn); }
 .muted.small { font-size: 12px; margin: 4px 0 0; }

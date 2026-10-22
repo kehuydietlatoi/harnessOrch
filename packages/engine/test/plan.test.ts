@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { markTask, parsePlan, setTaskAgent, validatePlan } from "../src/plan/plan.js";
+import { markTask, parsePlan, setTaskAgent, setTaskField, validatePlan } from "../src/plan/plan.js";
 
 const PLAN = `---
 title: Enemy AI
@@ -81,6 +81,21 @@ describe("plan file", () => {
     expect(replaced).toBe(PLAN.replace("agent: claude", "agent: codex"));
     expect(setTaskAgent(replaced, "T2", undefined)).toBe(PLAN.replace("  agent: claude\n", ""));
     expect(() => setTaskAgent(PLAN, "T9", "codex")).toThrow(/T9 not found/);
+  });
+
+  it("sets model and effort in routing order, and validates the effort", () => {
+    let text = setTaskField(PLAN, "T1", "effort", "high");
+    expect(text).toContain("  role: implement\n  effort: high\n  goal:");
+    text = setTaskField(text, "T1", "agent", "claude");
+    text = setTaskField(text, "T1", "model", "claude-sonnet-5-5");
+    expect(text).toContain("  role: implement\n  agent: claude\n  model: claude-sonnet-5-5\n  effort: high\n  goal:");
+    expect(parsePlan(text).plan.tasks[0]).toMatchObject({ agent: "claude", model: "claude-sonnet-5-5", effort: "high" });
+    expect(setTaskField(text, "T1", "effort", "max")).toContain("  effort: max\n");
+    expect(setTaskField(setTaskField(text, "T1", "effort", undefined), "T1", "model", undefined)).toContain("  agent: claude\n  goal:");
+    const bad = parsePlan(setTaskField(PLAN, "T1", "effort", "huge")).plan;
+    expect(validatePlan(bad, { agents: ["codex", "claude", "opencode"] }).errors).toContain("task T1: effort must be one of low, medium, high, xhigh, max");
+    const modelOnly = parsePlan(setTaskField(PLAN, "T1", "model", "x")).plan;
+    expect(validatePlan(modelOnly, { agents: ["codex", "claude", "opencode"] }).warnings).toContain("task T1: model x is ignored without an agent");
   });
 
   it("keeps CRLF line endings", () => {
