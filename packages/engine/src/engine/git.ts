@@ -56,7 +56,7 @@ export function findSharedDirs(repo: string, names: readonly string[], depth = 3
 /**
  * Worktrees start without gitignored dependency folders, so builds fail and
  * agents (who may not install packages) get stuck. Give each worktree its own
- * hard-linked copy of the main checkout's folder: almost no disk, and unlike a
+ * hard-linked copy of the main checkout's folder (see cloneTree): almost no disk, and unlike a
  * junction, an `npm ci` or `rm -rf node_modules` inside the worktree only
  * removes the worktree's links, never the real files. Kept git-ignored so it
  * never counts as a change.
@@ -79,9 +79,11 @@ export async function provideSharedDirs(repo: string, worktree: string, names: r
 /**
  * Mirror a directory with hard links (copy when linking is impossible, e.g.
  * across volumes). Symlinks are recreated, pointing into the new tree when
- * they pointed inside the source.
+ * they pointed inside the source. Dot entries (`.package-lock.json`, `.vite`,
+ * `.bin`, `.cache`) are real copies: tools rewrite those in place, and through
+ * a hard link that write would land in every other worktree and the main checkout.
  */
-export function cloneTree(src: string, dst: string): void {
+export function cloneTree(src: string, dst: string, link = true): void {
   mkdirSync(dst, { recursive: true });
   for (const name of readdirSync(src)) {
     const from = join(src, name);
@@ -96,10 +98,10 @@ export function cloneTree(src: string, dst: string): void {
       try { isDir = statSync(from).isDirectory(); } catch { /* dangling */ }
       symlinkSync(retarget, to, isDir ? (process.platform === "win32" ? "junction" : "dir") : "file");
     } else if (stat.isDirectory()) {
-      cloneTree(from, to);
-    } else {
+      cloneTree(from, to, link && !name.startsWith("."));
+    } else if (link && !name.startsWith(".")) {
       try { linkSync(from, to); } catch { copyFileSync(from, to); }
-    }
+    } else copyFileSync(from, to);
   }
 }
 

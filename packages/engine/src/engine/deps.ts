@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanEnvironment } from "../util/environment.js";
 import { exec } from "../util/exec.js";
@@ -62,6 +62,40 @@ export function packageManager(cwd: string): { cmd: string; args: string[] } | n
   return existsSync(join(cwd, "package-lock.json")) || existsSync(join(cwd, "npm-shrinkwrap.json"))
     ? { cmd: "npm", args: ["ci", "--no-audit", "--no-fund"] }
     : { cmd: "npm", args: ["install", "--no-package-lock", "--no-audit", "--no-fund"] };
+}
+
+/**
+ * Why `cwd`'s installed packages do not match its manifest, or null when they do.
+ * Catches a node_modules copied from a main checkout nobody re-installed after
+ * a dependency was added. Reads each package's own package.json rather than
+ * npm's node_modules/.package-lock.json, which can claim packages that are not
+ * there. With an npm lockfile every locked package must be installed at its
+ * locked version; otherwise every direct dependency must be installed.
+ */
+export function staleDeps(cwd: string): string | null {
+  const read = (rel: string): Json | null => {
+    try { return JSON.parse(readFileSync(join(cwd, rel), "utf8")) as Json; } catch { return null; }
+  };
+  const manifest = read("package.json");
+  if (!manifest) return null;
+  const lock = read("package-lock.json") ?? read("npm-shrinkwrap.json");
+  if (lock && typeof lock.packages === "object" && lock.packages) {
+    for (const [path, entry] of Object.entries(lock.packages as Record<string, Json>)) {
+      // Workspace links and platform-specific optional packages are legitimately absent.
+      if (!path.startsWith("node_modules/") || entry.link || entry.optional || entry.devOptional) continue;
+      const name = path.slice("node_modules/".length);
+      const have = read(`${path}/package.json`);
+      if (!have) return `${name} is not installed`;
+      if (have.version !== entry.version) return `${name} is ${String(have.version)}, locked at ${String(entry.version)}`;
+    }
+    return null;
+  }
+  for (const field of ["dependencies", "devDependencies"]) {
+    for (const name of Object.keys((manifest[field] ?? {}) as Json)) {
+      if (!read(`node_modules/${name}/package.json`)) return `${name} is not installed`;
+    }
+  }
+  return null;
 }
 
 /**

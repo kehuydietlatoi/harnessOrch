@@ -293,6 +293,28 @@ write_scope: [src/T1.txt]`));
     expect(sh(repo, "worktree", "list").split("\n")).toHaveLength(1);
   });
 
+  it("installs in worktrees whose copied dependencies miss a locked package, and keeps tool metadata unshared", async () => {
+    writeFileSync(join(repo, ".gitignore"), "node_modules/\n");
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "g", devDependencies: { dep: "1.0.0" } }));
+    writeFileSync(join(repo, "package-lock.json"), JSON.stringify({ lockfileVersion: 3, packages: { "": {}, "node_modules/dep": { version: "1.0.0" } } }));
+    sh(repo, "add", "-A");
+    sh(repo, "commit", "-q", "-m", "deps");
+    // The main checkout's npm record claims dep, but dep itself is missing.
+    mkdirSync(join(repo, "node_modules"), { recursive: true });
+    writeFileSync(join(repo, "node_modules", ".package-lock.json"), "main record\n");
+    const plan = writePlan(task("T1", "T", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const { runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      // A tool rewrites its metadata in place (no unlink), as npm does with its record.
+      writeFileSync(join(req.cwd, "node_modules", ".package-lock.json"), "worktree record\n");
+      return { ...done(), write: { "src/T1.txt": "x" } };
+    });
+    expect(await runner(plan, runTurn).run()).toBe("ready");
+    const ends = installs.map((p) => p.replaceAll("\\", "/").split("/").pop());
+    expect(ends).toEqual(expect.arrayContaining(["plan", "codex"]));
+    expect(readFileSync(join(repo, "node_modules", ".package-lock.json"), "utf8")).toBe("main record\n");
+  });
+
   it("re-runs plan checks when a fix adds no commit, and still reviews the task's merged commit", async () => {
     const flag = join(root, "env-ready");
     const planCheck = `node -e "require('fs').statSync(process.argv[1])" ${flag.replaceAll("\\", "/")}`;

@@ -15,7 +15,7 @@ import { blockedBy, nextDispatches, planFinished, type SchedTask } from "../sche
 import { listSkills, selectSkills, type Skill, type SkillRole } from "../skills/skills.js";
 import type { PlanStatus, RunPhase, Store } from "../store/store.js";
 import * as g from "./git.js";
-import { dependencyViolations, installDeps, isManifest, MANIFEST_GLOBS } from "./deps.js";
+import { dependencyViolations, installDeps, isManifest, MANIFEST_GLOBS, staleDeps } from "./deps.js";
 import { prepareWorktreeRemoval } from "../git/worktree.js";
 
 export interface RunnerDeps {
@@ -178,9 +178,22 @@ export class PlanRunner extends EventEmitter {
     return new Promise((resolve) => { this.wakeUp = resolve; });
   }
 
+  /** Worktrees whose installed dependencies were checked by this process; later changes go through syncDeps. */
+  private readonly depsChecked = new Set<string>();
+
   private async linkShared(worktree: string): Promise<void> {
     const linked = await g.provideSharedDirs(this.repo, worktree, this.cfg.sharedDirs);
     if (linked.length) this.say({ type: "info", message: `provided ${linked.join(", ")} to the ${basename(worktree)} worktree (hard-linked copy)` });
+    if (this.depsChecked.has(worktree)) return;
+    this.depsChecked.add(worktree);
+    // The copy is only as current as the main checkout: install before an agent or a check trips over a missing package.
+    const stale = staleDeps(worktree);
+    if (!stale) return;
+    const r = await this.deps.installDeps(worktree);
+    this.say({ type: "info", message: r.ok
+      ? `dependencies were out of date (${stale}); installed them in the ${basename(worktree)} worktree`
+      : `dependencies are out of date (${stale}) and installing them in the ${basename(worktree)} worktree failed:
+${r.output}` });
   }
 
   /** Agents with a turn in flight right now. */
