@@ -1164,8 +1164,23 @@ ${r.output}` });
     return sha;
   }
 
-  /** Remove the plan's worktrees and branches once merged. Dirty worktrees are kept (and reported). */
-  private async cleanup(): Promise<void> {
+  /**
+   * Throw a plan away without merging: remove its worktrees and its (unmerged) branches.
+   * Worktrees with uncommitted work are kept and returned. Never touches the base branch.
+   */
+  async discard(): Promise<string[]> {
+    if (this.running) throw new Error("plan is running; stop it first");
+    this.planBranch = `harness/${this.id}`;
+    const kept = await this.cleanup(true);
+    if (this.store.plan(this.key)) this.setStatus("discarded", kept.length ? `discarded; kept worktrees with uncommitted work: ${kept.join(", ")}` : "discarded without merging");
+    return kept;
+  }
+
+  /**
+   * Remove the plan's worktrees and branches. Dirty worktrees are kept (and reported).
+   * `force` deletes branches that were never merged (discard).
+   */
+  private async cleanup(force = false): Promise<string[]> {
     const kept: string[] = [];
     for (const name of ["plan", ...AGENTS]) {
       const path = join(this.wtRoot, name);
@@ -1176,10 +1191,11 @@ ${r.output}` });
         continue;
       }
       if ((await g.tryGit(this.repo, ["worktree", "remove", path])).code !== 0 && existsSync(path)) kept.push(path);
-      await g.tryGit(this.repo, ["branch", "-d", branch]);
+      await g.tryGit(this.repo, ["branch", force ? "-D" : "-d", branch]);
     }
     await g.tryGit(this.repo, ["worktree", "prune"]);
     if (kept.length) this.say({ type: "info", message: `kept worktrees with uncommitted work: ${kept.join(", ")}` });
+    return kept;
   }
 
   /** Snapshot for the board. */

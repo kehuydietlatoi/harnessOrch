@@ -66,7 +66,7 @@ function runnerFor(file: string): PlanRunner {
 function listPlans(): Array<{ file: string; title: string; tasks: number; done: number; errors: number; status: string | null }> {
   const dir = plansDir();
   if (!dir || !existsSync(dir)) return [];
-  const rank = (s: string | null): number => ({ running: 0, paused: 1, ready: 2 } as Record<string, number>)[s ?? ""] ?? (s === "merged" ? 9 : 3);
+  const rank = (s: string | null): number => ({ running: 0, paused: 1, ready: 2 } as Record<string, number>)[s ?? ""] ?? (s === "merged" || s === "discarded" ? 9 : 3);
   return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => {
     const file = join(dir, name);
     const { plan, errors } = parsePlan(readFileSync(file, "utf8"));
@@ -230,6 +230,7 @@ handle("plan:merge", async (file: string) => {
   await r.prepare();
   return r.mergeToBase();
 });
+handle("plan:discard", async (file: string) => runnerFor(file).discard());
 handle("plan:open", (file: string) => shell.openPath(file));
 handle("plan:taskDiff", async (file: string, taskId: string) => {
   // Commits live in the shared object store: no need to (re)create worktrees just to read a diff.

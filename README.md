@@ -21,7 +21,7 @@ For how the engine works inside (the loop, the task state machine, where state l
    The engine is the only writer of the plan file's checkboxes.
 4. **Guardrails.** Repeated failures and blocked agents go to the orchestrator: Codex first, then Opus. It can retry with guidance, reassign the task, or hand it to you. A paused task holds back only the tasks that depend on it. Usage limits fall back to the next agent, or wait for the reset.
 5. **Review.** When an agent's tasks are all done, a *different* agent reviews only that agent's diff. Rejections get at most 2 fix rounds.
-6. **Merge.** `ho merge` merges the plan branch into the base branch, after you say so.
+6. **Merge.** `ho merge` merges the plan branch into the base branch, after you say so. `ho discard` (or **Discard** on the board) throws a plan away instead: its worktrees and branches are removed without merging.
 
 ## Default routing (Claude Pro + ChatGPT Plus + free models)
 
@@ -55,7 +55,7 @@ npm run desktop        # builds the engine, then starts the Electron app (dev mo
 | M0: CLI spikes | Done. See [docs/m0-spikes.md](docs/m0-spikes.md). |
 | M1: engine + `ho` | Done. Live runs average about 27–39k effective tokens per task, against about 229k per issue in the old harness on its sandbox and about 2.65M per issue on a real repo. |
 | M2: desktop | Board, planner terminal, live agent streams, notifications and merge all work. A live 4-task run was started from the app. **Take over** is built but not yet exercised live. |
-| M3: skills | 7 vendored skills: 5 core (by role) and 2 project. The planner is told which project skills exist. Size limits are enforced by tests. |
+| M3: skills | 8 vendored skills: 5 core (by role) and 3 project. The planner is told which project skills exist. Size limits are enforced by tests. |
 
 **Not built yet:**
 - An engine MCP server for the planner. The planner writes the file directly and the app watches it.
@@ -71,7 +71,7 @@ npm install
 npm run ho -w packages/engine -- doctor
 npm run ho -w packages/engine -- validate .harness/plans/x.md --repo <repo>
 npm run ho -w packages/engine -- run .harness/plans/x.md --repo <repo>
-npm run ho -w packages/engine -- status|merge .harness/plans/x.md --repo <repo>
+npm run ho -w packages/engine -- status|merge|discard .harness/plans/x.md --repo <repo>rge .harness/plans/x.md --repo <repo>
 npm run ho -w packages/engine -- resume .harness/plans/x.md T3 --guidance "..." [--agent codex] --repo <repo>
 ```
 

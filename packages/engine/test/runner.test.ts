@@ -136,6 +136,20 @@ describe("plan runner", { timeout: 90_000 }, () => {
     expect(store.plan(KEY())?.status).toBe("merged");
   });
 
+  it("discards a plan without merging: worktrees and unmerged branches go, the base branch is untouched", async () => {
+    const plan = writePlan(task("T1", "Throwaway", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const { runTurn } = fakeTurns((req) => req.prompt.startsWith("Review the changes") ? approve : { ...done(), write: { "src/T1.txt": "x" } });
+    const r = runner(plan, runTurn);
+    expect(await r.run()).toBe("ready");
+    expect(sh(repo, "branch", "--list", "harness/*")).not.toBe("");
+
+    expect(await r.discard()).toEqual([]);
+    expect(sh(repo, "branch", "--list", "harness/*")).toBe("");
+    expect(sh(repo, "worktree", "list").split("\n")).toHaveLength(1);
+    expect(existsSync(join(repo, "src", "T1.txt"))).toBe(false);
+    expect(store.plan(KEY())?.status).toBe("discarded");
+  });
+
   it("feeds filtered check failures back into the same session until they pass", async () => {
     const plan = writePlan(task("T1", "Fix me", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]\nchecks: ["${contains("src/T1.txt", "good").replaceAll('"', '\\"')}"]`));
     const { calls, runTurn } = fakeTurns((req) => {

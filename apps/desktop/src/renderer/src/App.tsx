@@ -18,6 +18,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(initialHash.get("task"));
   const [confirmStop, setConfirmStop] = useState(false);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const term = useTerminals(setError);
 
   useEffect(() => { const tab = initialHash.get("tab"); if (tab) term.setActive(tab); }, [term.setActive]);
@@ -98,15 +99,27 @@ export function App() {
         <span className={`status-pill ${status}`}>{status}</span>
         <div className="spacer" />
         {planFile && <button className="ghost" onClick={() => void api.call("plan:open", planFile)}>Plan file</button>}
-        {snap && !snap.running && !["ready", "merged"].includes(status) &&
+        {snap && !snap.running && !["ready", "merged", "discarded"].includes(status) &&
           <button className="primary" disabled={!!snap.errors.length} onClick={() => void guard(api.call("plan:start", planFile))}>▶ Start</button>}
         {snap?.running && !confirmStop && <button onClick={() => setConfirmStop(true)}>■ Stop</button>}
         {status === "ready" && <button className="primary" onClick={async () => { if (await guard(api.call<string>("plan:merge", planFile))) void refreshSnap(); }}>Merge to {snap?.baseBranch ?? "main"}</button>}
+        {snap && !snap.running && status && !["merged", "discarded"].includes(status) && !confirmDiscard &&
+          <button className="ghost" title="Remove this plan's worktrees and branches without merging" onClick={() => setConfirmDiscard(true)}>Discard</button>}
       </header>
 
       {snap && <StatusStrip snap={snap} onSelectTask={setSelected} />}
 
       <div className="banners">
+        {confirmDiscard && (
+          <div className="confirm-box wide">
+            <div className="confirm-title">Discard this plan?</div>
+            <p className="small-text">Its worktrees and branches are deleted without merging. Worktrees with uncommitted work are kept. The plan file stays.</p>
+            <div className="row">
+              <button className="ghost small" onClick={() => setConfirmDiscard(false)}>Keep it</button>
+              <button className="danger small" onClick={async () => { setConfirmDiscard(false); if (await guard(api.call("plan:discard", planFile))) void refreshSnap(); }}>Discard</button>
+            </div>
+          </div>
+        )}
         {confirmStop && snap && (() => {
           const stoppable = snap.tasks.filter((t) => STOPPABLE.includes(t.status));
           return (

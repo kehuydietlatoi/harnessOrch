@@ -21,6 +21,7 @@ const USAGE = `ho — harnessOrch engine
                                              retry a paused task, then run
   ho review <plan.md> <agent> approve|retry  settle a review that needs you
   ho merge <plan.md>                         merge the finished plan into its base branch
+  ho discard <plan.md>                       throw the plan away: remove its worktrees and branches, no merge
   ho doctor                                  check the agent CLIs
 
 Options: --repo <dir> (default: current directory), --config <file.json>`;
@@ -149,6 +150,12 @@ async function main(argv: string[]): Promise<number> {
         await runner.prepare();
         const sha = await runner.mergeToBase();
         console.log(pc.green(`✓ merged (${sha.slice(0, 8)})`));
+        return 0;
+      }
+      case "discard": {
+        runner.load();
+        const kept = await runner.discard();
+        console.log(kept.length ? pc.yellow(`discarded; kept worktrees with uncommitted work: ${kept.join(", ")}`) : pc.green("✓ discarded"));
         return 0;
       }
       default:

@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { ThreadTotals, TurnUsage } from "../agents/turn.js";
 import { LEGACY_STATES, type TaskState } from "../engine/lifecycle.js";
 
-export type PlanStatus = "running" | "paused" | "reviewing" | "ready" | "merged" | "stopped";
+export type PlanStatus = "running" | "paused" | "reviewing" | "ready" | "merged" | "stopped" | "discarded";
 export type RunPhase = "implement" | "fix" | "review" | "orchestrate" | "conflict";
 
 export interface PlanRow {
