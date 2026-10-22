@@ -60,7 +60,7 @@ npm run desktop        # builds the engine, then starts the Electron app (dev mo
 - Persistent `codex app-server` / Claude stream-json sessions. Today each task is a resumed one-shot turn.
 - Packaging with electron-builder.
 
-**Open question:** whether Codex's per-turn usage is cumulative on resumed threads. This affects the ledger only.
+Codex's `turn.completed` usage is cumulative per thread. The engine stores each thread's totals with its session and records only the difference.
 
 ## Engine CLI (`ho`)
 

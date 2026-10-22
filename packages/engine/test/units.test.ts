@@ -66,6 +66,25 @@ describe("turn reducers", () => {
     expect(r.usage).toEqual({ input: 13676, cacheRead: 13184, cacheWrite: 0, output: 155, requests: 2, contextTokens: 13430 });
   });
 
+  it("subtracts a resumed Codex thread's earlier totals (turn.completed is cumulative per thread)", () => {
+    // Real totals from two consecutive turns on one thread.
+    const first = { input: 211091, cached: 148224, cacheWrite: 0, output: 1207 };
+    const raw = [
+      j({ type: "thread.started", thread_id: "t-1" }),
+      j({ type: "item.completed", item: { type: "reasoning" } }),
+      j({ type: "item.completed", item: { type: "command_execution" } }),
+      j({ type: "item.completed", item: { type: "agent_message", text: "need permission" } }),
+      j({ type: "turn.completed", usage: { input_tokens: 309601, cached_input_tokens: 244736, cache_write_input_tokens: 0, output_tokens: 1456 } }),
+    ].join("\n");
+    const r = reduceCodex(raw, { threadId: "t-1", totals: first });
+    expect(r.usage).toEqual({ input: 1998, cacheRead: 96512, cacheWrite: 0, output: 249, requests: 3, contextTokens: 32837 });
+    expect(r.threadTotals).toEqual({ input: 309601, cached: 244736, cacheWrite: 0, output: 1456 });
+    // A different thread (the resume did not take) is counted whole.
+    expect(reduceCodex(raw, { threadId: "t-other", totals: first }).usage.cacheRead).toBe(244736);
+    // No turn.completed (killed turn): no totals, so the caller keeps the old ones.
+    expect(reduceCodex(j({ type: "thread.started", thread_id: "t-1" }), { threadId: "t-1", totals: first }).threadTotals).toBeUndefined();
+  });
+
   it("sums OpenCode steps and parses a fenced result", () => {
     const raw = [
       j({ type: "step_finish", sessionID: "ses_1", part: { tokens: { input: 11513, output: 78, cache: { read: 1792, write: 0 } } } }),
@@ -207,6 +226,9 @@ describe("store", () => {
     expect(s.task("p", "T2")?.status).toBe("done");
     s.saveSession({ planId: "p", agent: "codex", sessionId: "t-1", contextTokens: 5000, turns: 1 });
     expect(s.session("p", "codex")?.sessionId).toBe("t-1");
+    const threadTotals = { input: 9, cached: 5, cacheWrite: 0, output: 2 };
+    s.saveSession({ planId: "p", agent: "codex", sessionId: "t-1", contextTokens: 5000, turns: 2, threadTotals });
+    expect(s.session("p", "codex")?.threadTotals).toEqual(threadTotals);
     s.dropSession("p", "codex");
     expect(s.session("p", "codex")).toBeUndefined();
     const usage = { input: 1, cacheRead: 2, cacheWrite: 3, output: 4, requests: 1, contextTokens: 6 };

@@ -51,7 +51,7 @@ codex exec --json --ignore-user-config --output-schema <file> \
   | Unused features disabled (list below) | 26,860 | 13,184 |
 
   Disabling the unused features roughly halves the baseline. The engine disables these by default: `apps browser_use browser_use_external computer_use multi_agent plugins remote_plugin skill_search tool_suggest goals image_generation in_app_browser sleep_tool`. `image_generation` is re-enabled only for asset tasks.
-- **Open question:** a resumed second turn reported 105k input tokens. This needs one more probe to tell whether `turn.completed` usage is per-turn or cumulative per thread. The ledger must not double-count either way.
+- **Usage is cumulative per thread (settled 2026-10-22).** On live runs, four turns resumed on one thread reported totals that only grew (`input_tokens` 211k, 310k, 411k, 515k). A resumed turn's usage is its total minus the previous turn's total.
 
 ## OpenCode free models: both work headless
 

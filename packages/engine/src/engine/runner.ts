@@ -395,7 +395,7 @@ export class PlanRunner extends EventEmitter {
     const logFile = this.logFile(`${opts.taskId ?? opts.phase}-${agent}`);
     const result = await this.deps.runTurn({
       agent, model: ref, cwd: opts.cwd, prompt: opts.prompt, logFile,
-      ...(prior ? { resumeSession: prior.sessionId } : {}),
+      ...(prior ? { resumeSession: prior.sessionId, ...(prior.threadTotals ? { threadTotals: prior.threadTotals } : {}) } : {}),
       ...(opts.schema && agent !== "opencode" ? { schema: opts.schema } : {}),
       readOnly: opts.readOnly, imageGeneration: opts.images, adapter: this.cfg.adapters[agent],
       checkCommands: [...new Set([...this.plan.header.checks, ...this.plan.tasks.flatMap((t) => t.checks)])],
@@ -415,7 +415,13 @@ export class PlanRunner extends EventEmitter {
         // Next task starts a fresh session with a handoff instead of replaying this context.
         this.store.dropSession(this.key, agent);
         this.say({ type: "info", message: `${agent} session reached ${result.usage.contextTokens} context tokens; rotating` });
-      } else this.store.saveSession({ planId: this.key, agent, sessionId: result.sessionId, contextTokens: result.usage.contextTokens, turns });
+      } else {
+        // A turn killed before Codex reported totals keeps the old ones, so the next turn's usage includes it.
+        const sameThread = prior?.sessionId === result.sessionId;
+        const threadTotals = result.threadTotals ?? (sameThread ? prior?.threadTotals : undefined);
+        this.store.saveSession({ planId: this.key, agent, sessionId: result.sessionId, contextTokens: result.usage.contextTokens, turns,
+          ...(threadTotals ? { threadTotals } : {}) });
+      }
     }
     if (result.usageLimit) this.markLimited(agent, result.usageLimit.resetAt);
     // Workers must stay in their own worktree. The plan worktree is the integration branch: undo stray edits there.

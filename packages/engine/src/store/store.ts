@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { TurnUsage } from "../agents/turn.js";
+import type { ThreadTotals, TurnUsage } from "../agents/turn.js";
 import type { TaskStatus } from "../scheduler/scheduler.js";
 
 export type PlanStatus = "running" | "paused" | "reviewing" | "ready" | "merged" | "stopped";
@@ -38,6 +38,8 @@ export interface SessionRow {
   sessionId: string;
   contextTokens: number;
   turns: number;
+  /** Codex: the thread's running usage after its last turn. */
+  threadTotals?: ThreadTotals;
 }
 
 export interface RunRow {
@@ -81,7 +83,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   commit_sha TEXT, orchestrated INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (plan_id, id));
 CREATE TABLE IF NOT EXISTS sessions (
   plan_id TEXT NOT NULL, agent TEXT NOT NULL, session_id TEXT NOT NULL,
-  context_tokens INTEGER NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (plan_id, agent));
+  context_tokens INTEGER NOT NULL DEFAULT 0, turns INTEGER NOT NULL DEFAULT 0, thread_totals TEXT,
+  PRIMARY KEY (plan_id, agent));
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id TEXT NOT NULL, task_id TEXT, agent TEXT NOT NULL, model TEXT,
   phase TEXT NOT NULL, outcome TEXT NOT NULL, input INTEGER NOT NULL, cache_read INTEGER NOT NULL,
@@ -106,6 +109,8 @@ export class Store {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    const sessionColumns = this.db.prepare("PRAGMA table_info(sessions)").all() as Row[];
+    if (!sessionColumns.some((c) => c.name === "thread_totals")) this.db.exec("ALTER TABLE sessions ADD COLUMN thread_totals TEXT");
   }
 
   close(): void { this.db.close(); }
@@ -170,13 +175,18 @@ export class Store {
 
   session(planId: string, agent: string): SessionRow | undefined {
     const r = this.db.prepare("SELECT * FROM sessions WHERE plan_id = ? AND agent = ?").get(planId, agent) as Row | undefined;
-    return r && { planId, agent, sessionId: r.session_id as string, contextTokens: Number(r.context_tokens), turns: Number(r.turns) };
+    const totals = str(r?.thread_totals);
+    return r && {
+      planId, agent, sessionId: r.session_id as string, contextTokens: Number(r.context_tokens), turns: Number(r.turns),
+      ...(totals ? { threadTotals: JSON.parse(totals) as ThreadTotals } : {}),
+    };
   }
 
   saveSession(s: SessionRow): void {
-    this.db.prepare(`INSERT INTO sessions (plan_id, agent, session_id, context_tokens, turns) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(plan_id, agent) DO UPDATE SET session_id = excluded.session_id, context_tokens = excluded.context_tokens, turns = excluded.turns`)
-      .run(s.planId, s.agent, s.sessionId, s.contextTokens, s.turns);
+    this.db.prepare(`INSERT INTO sessions (plan_id, agent, session_id, context_tokens, turns, thread_totals) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(plan_id, agent) DO UPDATE SET session_id = excluded.session_id, context_tokens = excluded.context_tokens,
+        turns = excluded.turns, thread_totals = excluded.thread_totals`)
+      .run(s.planId, s.agent, s.sessionId, s.contextTokens, s.turns, s.threadTotals ? JSON.stringify(s.threadTotals) : null);
   }
 
   dropSession(planId: string, agent: string): void {

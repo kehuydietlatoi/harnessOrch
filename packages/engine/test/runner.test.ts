@@ -96,7 +96,8 @@ describe("plan runner", { timeout: 90_000 }, () => {
     const { calls, runTurn } = fakeTurns((req) => {
       if (req.prompt.startsWith("Review the changes")) return approve;
       const id = taskId(req.prompt)!;
-      return { ...done(`${id} ok`), write: { [`src/${id}.txt`]: id === "T1" ? "one" : id } };
+      const threadTotals = req.agent === "codex" ? { threadTotals: { input: 500, cached: 400, cacheWrite: 0, output: 10 } } : {};
+      return { ...done(`${id} ok`), ...threadTotals, write: { [`src/${id}.txt`]: id === "T1" ? "one" : id } };
     });
     const r = runner(plan, runTurn);
     expect(await r.run()).toBe("ready");
@@ -111,6 +112,8 @@ describe("plan runner", { timeout: 90_000 }, () => {
     // Codex's second task resumed its first task's session.
     const codexTasks = calls.filter((c) => c.agent === "codex" && c.prompt.startsWith("# Task"));
     expect(codexTasks.map((c) => c.resumeSession)).toEqual([undefined, "codex-session-1"]);
+    // Codex reports thread totals: the resumed turn gets the first turn's totals to subtract.
+    expect(codexTasks[1]?.threadTotals).toEqual({ input: 500, cached: 400, cacheWrite: 0, output: 10 });
     // T2 is a small task: first routing choice is a free OpenCode model, with a fenced result.
     expect(calls.find((c) => c.prompt.includes("# Task T2"))?.agent).toBe("opencode");
     // Each author reviewed once, by a different agent, read-only.
@@ -337,7 +340,8 @@ write_scope: [src/T1.txt]`));
     const base = { code: 0, timedOut: false, durationMs: 1, text: "", usage };
     const runTurn = async (req: TurnRequest): Promise<TurnResult> => {
       calls.push(req);
-      const sessionId = req.resumeSession ?? `${req.agent}-s${calls.length}`;
+      // Session ids by agent, not call order: T1 and T2 start concurrently.
+      const sessionId = req.resumeSession ?? `${req.agent}-s${calls.filter((c) => c.agent === req.agent).length}`;
       if (req.prompt.startsWith("You are the orchestrator")) return { ...base, sessionId, structured: { action: "human", agent: "", guidance: "needs vite" } };
       if (req.prompt.startsWith("Review the changes")) return { ...base, sessionId, ...approve };
       if (req.prompt.startsWith("# Task T2")) {

@@ -28,6 +28,14 @@ export interface TurnUsage {
   contextTokens: number;
 }
 
+/** Codex's running usage for a whole thread, as its `turn.completed` reports it. */
+export interface ThreadTotals {
+  input: number;
+  cached: number;
+  cacheWrite: number;
+  output: number;
+}
+
 export interface TurnRequest {
   agent: AgentId;
   model: ModelSpec;
@@ -35,6 +43,8 @@ export interface TurnRequest {
   prompt: string;
   /** Continue this session instead of starting one. */
   resumeSession?: string;
+  /** Codex only: the resumed thread's totals after its previous turn, subtracted to get this turn's usage. */
+  threadTotals?: ThreadTotals;
   /** JSON Schema the final answer must satisfy. */
   schema?: object;
   readOnly?: boolean;
@@ -61,6 +71,8 @@ export interface TurnResult {
   /** Schema-bound result, when the agent produced one. */
   structured?: unknown;
   usage: TurnUsage;
+  /** Codex only: the thread's totals after this turn, when it reported them. */
+  threadTotals?: ThreadTotals;
   usageLimit?: UsageLimit;
 }
 
@@ -194,11 +206,15 @@ export function reduceClaude(raw: string): Omit<TurnResult, "code" | "timedOut" 
   return { text, sessionId, usage, ...(structured !== undefined ? { structured } : {}) };
 }
 
-/** Reduce a Codex `exec --json` turn. `input_tokens` includes the cached part. */
-export function reduceCodex(raw: string): Omit<TurnResult, "code" | "timedOut" | "durationMs"> {
+/**
+ * Reduce a Codex `exec --json` turn. `turn.completed` reports the thread's running
+ * totals, so a resumed turn's usage is those minus the totals `resumed` had. `input_tokens` includes the cached part.
+ */
+export function reduceCodex(raw: string, resumed?: { threadId: string; totals: ThreadTotals }): Omit<TurnResult, "code" | "timedOut" | "durationMs"> {
   const usage = emptyUsage();
   let text = "";
   let sessionId: string | undefined;
+  let threadTotals: ThreadTotals | undefined;
   let items = 0;
   for (const e of parseLines(raw)) {
     if (e.type === "thread.started" && typeof e.thread_id === "string") sessionId = e.thread_id;
@@ -209,16 +225,21 @@ export function reduceCodex(raw: string): Omit<TurnResult, "code" | "timedOut" |
     }
     if (e.type === "turn.completed") {
       const u = obj(e.usage);
-      usage.cacheRead = num(u.cached_input_tokens);
-      usage.cacheWrite = num(u.cache_write_input_tokens);
-      usage.input = Math.max(0, num(u.input_tokens) - usage.cacheRead - usage.cacheWrite);
-      usage.output = num(u.output_tokens);
+      threadTotals = { input: num(u.input_tokens), cached: num(u.cached_input_tokens), cacheWrite: num(u.cache_write_input_tokens), output: num(u.output_tokens) };
     }
+  }
+  if (threadTotals) {
+    const prior = resumed && (sessionId ?? resumed.threadId) === resumed.threadId ? resumed.totals : undefined;
+    const since = (k: keyof ThreadTotals): number => Math.max(0, threadTotals![k] - (prior?.[k] ?? 0));
+    usage.cacheRead = since("cached");
+    usage.cacheWrite = since("cacheWrite");
+    usage.input = Math.max(0, since("input") - usage.cacheRead - usage.cacheWrite);
+    usage.output = since("output");
   }
   // Codex reports no per-request usage: each completed item is roughly one model request.
   usage.requests = Math.max(1, items);
   usage.contextTokens = Math.round((usage.input + usage.cacheRead + usage.cacheWrite) / usage.requests);
-  return { text, sessionId, usage, ...structuredFrom(text) };
+  return { text, sessionId, usage, ...(threadTotals ? { threadTotals } : {}), ...structuredFrom(text) };
 }
 
 /** Reduce an OpenCode `run --format json` turn. `tokens.input` excludes cache reads. */
@@ -305,7 +326,7 @@ export async function runTurn(req: TurnRequest): Promise<TurnResult> {
       cwd: req.cwd, env, input: req.prompt, timeoutMs: req.timeoutMs, logFile: req.logFile, onLine: req.onLine, abortOn: abort,
     });
     const raw = readFileSync(req.logFile, "utf8");
-    const reduced = req.agent === "claude" ? reduceClaude(raw) : req.agent === "codex" ? reduceCodex(raw) : reduceOpencodeTurn(raw);
+    const reduced = req.agent === "claude" ? reduceClaude(raw) : req.agent === "codex" ? reduceCodex(raw, req.resumeSession && req.threadTotals ? { threadId: req.resumeSession, totals: req.threadTotals } : undefined) : reduceOpencodeTurn(raw);
     const usageLimit = proc.code === 0 ? null : detectUsageLimit(raw);
     return {
       ...reduced,
