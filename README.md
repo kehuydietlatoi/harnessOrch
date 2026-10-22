@@ -6,6 +6,8 @@ The design comes from measuring the old `harness_orchestrator`, which averaged a
 
 ## How a plan runs
 
+For how the engine works inside (the loop, the task state machine, where state lives), see [docs/architecture.md](docs/architecture.md).
+
 1. **Plan.** Opus writes `.harness/plans/<slug>.md` in your repo: a YAML header plus `- [ ] **T1 — Title**` tasks, each with a YAML block (`role`, optional `agent`, `goal`, `done_when`, `checks`, `write_scope`, `read_first`, `depends_on`, `skills`).
 2. **Run.** The engine schedules tasks by dependency, with at most 3 agents at once.
    - Each agent works through its tasks in **one ongoing session** (cache-warm), in its own git worktree.
