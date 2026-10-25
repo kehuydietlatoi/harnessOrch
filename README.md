@@ -69,6 +69,7 @@ To change any of this, use the ⚙ **Routing & models** dialog in the desktop ap
 
 The Codex model pickers include GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, and GPT-5.6 Sol, Terra and Luna, following the [current OpenAI model lineup](https://learn.chatgpt.com/docs/models). Custom model ids can also be entered in the pickers or saved under **Extra model ids**. Availability depends on your Codex account.
 
+The desktop app also has a **Graph** view beside the board: tasks by dependency, then each author's review, then the merge. A task that needs you can have its agent and model changed in the Resume box.
 
 ## Desktop app
 

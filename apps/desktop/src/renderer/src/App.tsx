@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, STOPPABLE, type EventView, type PlanListItem, type RunnerEvent, type Snapshot } from "./api";
+import { api, prefs, STOPPABLE, type EventView, type PlanListItem, type RunnerEvent, type Snapshot } from "./api";
 import { Board } from "./Board";
 import { Drawer, useTerminals } from "./Drawer";
+import { Graph } from "./Graph";
 import { Settings } from "./Settings";
 import { banner, formatLine } from "./format";
 import { StatusStrip } from "./StatusStrip";
 import { ReviewPanel } from "./ReviewPanel";
 import { TaskPanel } from "./TaskPanel";
 
-/** Dev/screenshot hook: `#task=T1&tab=activity&settings=1` preselects a task, drawer tab and the settings dialog. */
+/** Dev/screenshot hook: `#task=T1&tab=activity&view=graph&settings=1` preselects a task, drawer tab, view and the settings dialog. */
 const initialHash = new URLSearchParams(window.location.hash.slice(1));
 
 export function App() {
@@ -20,9 +21,11 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(initialHash.get("task"));
   const [confirmStop, setConfirmStop] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [view, setView] = useState<"board" | "graph">(() => (initialHash.get("view") as "board" | "graph" | null) ?? prefs.get<"board" | "graph">("view", "board"));
   const [showSettings, setShowSettings] = useState(initialHash.has("settings"));
   const term = useTerminals(setError);
 
+  useEffect(() => { prefs.set("view", view); }, [view]);
   useEffect(() => { const tab = initialHash.get("tab"); if (tab) term.setActive(tab); }, [term.setActive]);
 
   const guard = useCallback(async <T,>(p: Promise<T>): Promise<T | undefined> => {
@@ -99,6 +102,10 @@ export function App() {
           {plans.map((p) => <option key={p.file} value={p.file}>{p.title} ({p.done}/{p.tasks}){p.errors ? " ⚠" : ""}</option>)}
         </select>
         <span className={`status-pill ${status}`}>{status}</span>
+        <div className="seg-toggle" role="group" aria-label="View">
+          <button className={view === "board" ? "active" : ""} onClick={() => setView("board")}>Board</button>
+          <button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>Graph</button>
+        </div>
         <div className="spacer" />
         <button className="ghost icon" title="Routing & models" onClick={() => setShowSettings(true)}>⚙</button>
         {planFile && <button className="ghost" onClick={() => void api.call("plan:open", planFile)}>Plan file</button>}
@@ -146,8 +153,10 @@ export function App() {
 
       <main className={task || reviewAgent ? "with-panel" : ""}>
         {snap ? (
-          <Board snap={snap} selected={selected} onSelect={(id) => setSelected((cur) => (cur === id ? null : id))}
-            blockedReviews={blockedReviews} onReview={(agent, action) => void guard(api.call("plan:review", planFile, agent, action))} />
+          view === "graph"
+            ? <Graph snap={snap} selected={selected} onSelect={(id) => setSelected((cur) => (cur === id ? null : id))} />
+            : <Board snap={snap} selected={selected} onSelect={(id) => setSelected((cur) => (cur === id ? null : id))}
+              blockedReviews={blockedReviews} onReview={(agent, action) => void guard(api.call("plan:review", planFile, agent, action))} />
         ) : (
           <div className="empty">
             {repo

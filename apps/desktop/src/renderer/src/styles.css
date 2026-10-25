@@ -213,6 +213,40 @@ ul.activity li pre { margin: 4px 0; padding: 8px; background: var(--bg); border-
 /* resume box model input */
 .model-input { width: 190px; }
 
+/* board | graph toggle */
+.seg-toggle { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg-toggle button { border: none; border-radius: 0; padding: 3px 12px; background: transparent; color: var(--muted); }
+.seg-toggle button.active { background: var(--panel-3); color: var(--text); }
+
+/* dependency graph */
+.graph { overflow: auto; padding: 4px; min-height: 0; }
+.graph svg { display: block; }
+.g-click { cursor: pointer; }
+.g-node { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.5; transition: fill .15s; }
+.g-click:hover .g-node { fill: var(--panel-3); }
+.g-node.selected { stroke: var(--accent); stroke-width: 2.5; }
+.g-node.codex { stroke: var(--codex); }
+.g-node.claude { stroke: var(--claude); }
+.g-node.opencode { stroke: var(--opencode); }
+.g-node.running { fill: #172037; }
+.g-node.needs-you { fill: #2a2411; stroke: var(--warn); }
+.g-node.done { fill: #14261b; }
+.g-node.queued { fill: var(--panel); }
+.g-node.review { stroke-dasharray: 5 3; stroke: var(--warn); }
+.g-node.review.done, .g-node.merge.done { stroke: var(--ok); }
+.g-node.merge { stroke-dasharray: 5 3; stroke: var(--muted); }
+.g-node.live { animation: pulse 1.4s infinite; }
+.g-id { fill: var(--text); font-weight: 700; font-size: 13px; }
+.g-title { fill: var(--text); font-size: 12px; }
+.g-sub { fill: var(--muted); font-size: 11px; }
+.g-agent { font-size: 11px; fill: var(--muted); }
+.g-agent.codex { fill: var(--codex); }
+.g-agent.claude { fill: var(--claude); }
+.g-agent.opencode { fill: var(--opencode); }
+.g-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 4 3; opacity: .7; }
+.g-edge.met { stroke: var(--ok); stroke-dasharray: none; opacity: .8; }
+.g-arrow { fill: var(--muted); }
+
 /* settings dialog */
 .modal-back { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); display: grid; place-items: center; z-index: 50; }
 .modal { width: min(760px, 94vw); max-height: 88vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
