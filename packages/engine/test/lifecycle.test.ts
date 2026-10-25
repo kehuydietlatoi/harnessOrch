@@ -21,6 +21,7 @@ describe("task lifecycle", () => {
     ["checking", "passed", "merging"],
     ["checking", "failed", "working"],
     ["checking", "attemptsExhausted", "escalating"],
+    ["checking", "outOfScope", "waiting"],
     ["checking", "stop", "stopped"],
     ["checking", "appClosed", "interrupted"],
     ["merging", "merged", "done"],

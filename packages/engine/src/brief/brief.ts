@@ -52,12 +52,14 @@ export interface BriefContext {
 
 const RULES = [
   "Work only inside the write scope. Do not edit the plan file, AGENTS.md or CLAUDE.md.",
+  "If the goal truly cannot be met without changing a file outside the write scope, change it and list it in files_changed: the engine asks the human to allow it. Unlisted edits outside the scope are reverted.",
   "Read the listed files (and line ranges) first; search with grep/glob instead of reading whole directories.",
   "Run checks only through the hverify command below; it prints just the failures.",
   "Do not commit or push; the engine commits and merges your work.",
   "Dependencies are already installed. If the task needs a new library or tool for development or tests, add it yourself as a dev dependency (e.g. `npm install -D <pkg>`). Never add production dependencies or upgrade, remove or reinstall existing packages: the engine reverts that.",
   "Stay inside your working directory. Never change other folders, other worktrees or node_modules.",
-  "If something outside your scope blocks you, stop and report status \"blocked\" with your questions.",
+  "If a decision you cannot make blocks you (unclear requirements, conflicting instructions), stop and report status \"blocked\" with your questions.",
+  "If a check cannot run at all for a reason you cannot fix inside your write scope (shell syntax for another platform, a missing script or tool, a wrong path), do not work around it with new packages or scripts: report status \"blocked\" with the command and why it cannot run. The engine fixes the check.",
 ];
 
 const bullets = (items: readonly string[]): string => items.map((i) => `- ${i}`).join("\n");

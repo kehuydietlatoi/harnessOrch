@@ -15,13 +15,45 @@ For how the engine works inside (the loop, the task state machine, where state l
 3. **Done means verified.** A task counts as done only when all of these hold:
    - the agent's structured result says so;
    - the engine's own checks pass (run through a failure-only filter);
-   - the changed files stay in scope (anything outside is reverted automatically);
+   - the changed files stay inside the task's write scope (see [Write scope](#write-scope) below);
    - the commit merges into the plan branch `harness/<slug>`.
 
    The engine is the only writer of the plan file's checkboxes.
-4. **Guardrails.** Repeated failures and blocked agents go to the orchestrator: Codex first, then Opus. It can retry with guidance, reassign the task, or hand it to you. A paused task holds back only the tasks that depend on it. Usage limits fall back to the next agent, or wait for the reset.
+4. **Guardrails.** Repeated failures and blocked agents go to the orchestrator: Codex first, then Opus. It can retry with guidance, reassign the task, fix a check that cannot run (for example Unix-only syntax on Windows; it rewrites that check in the plan file and never drops one), or hand it to you. A paused task holds back only the tasks that depend on it. Usage limits fall back to the next agent, or wait for the reset.
 5. **Review.** When an agent's tasks are all done, a *different* agent reviews only that agent's diff. Rejections get at most 2 fix rounds.
 6. **Merge.** `ho merge` merges the plan branch into the base branch, after you say so. `ho discard` (or **Discard** on the board) throws a plan away instead: its worktrees and branches are removed without merging.
+
+## Write scope
+
+Every task in a plan has a `write_scope`: the list of files (globs allowed) that the task may change. The planner sets it when it writes the plan:
+
+```yaml
+write_scope: ["content/items/ultra-split-bow.json"]
+```
+
+**Why it exists.**
+- **Parallel safety.** Tasks whose scopes overlap never run at the same time, so two agents never edit the same file at once.
+- **No drift.** An agent can't wander off and "improve" unrelated code.
+
+Package manifests and lockfiles are always writable, so agents can add dev dependencies. The plan file, `AGENTS.md` and `CLAUDE.md` never are.
+
+**What happens when an agent edits outside its scope.** It depends on whether the agent *meant* to:
+
+| The agent… | The engine… |
+|---|---|
+| changed a file but didn't list it in its result (`files_changed`) | treats it as a stray edit and reverts it silently; the task carries on |
+| changed a file and listed it, so it says it needs it | keeps the edit parked on the stash and pauses the task in **Needs you** |
+
+When a task pauses for this, the card is titled *"The agent needs files outside its write scope"* and lists the files. You have three choices:
+- **Allow files and resume.** The files join the task's scope, the edits come back, and the task finishes. The plan file isn't changed; the allowance is stored with the task.
+- **Resume without them.** The engine reverts those files and tells the agent to finish inside its scope, or report that it's blocked.
+- **Skip task** or **Restart clean**, as for any paused task.
+
+If a *review fix* needs such files, the review card offers the same choices: **Allow files and continue**, or **Revert them and continue**.
+
+**When to allow.** Allow when the goal really can't be met inside the scope. A typical case is content that needs a small engine or sim fix: for example, an item whose effect needs a bug fixed in the code that computes it. If the files look unrelated to the goal, don't allow them.
+
+From the CLI: `ho resume <plan.md> <task> --allow-scope`, or `ho review <plan.md> <agent> retry --allow-scope`.
 
 ## Default routing (Claude Pro + ChatGPT Plus + free models)
 
@@ -46,7 +78,7 @@ npm run desktop        # builds the engine, then starts the Electron app (dev mo
 2. **Start planning session** opens an interactive Opus terminal. It has the plan-format prompt and none of your global plugins or MCP servers. On a folder it hasn't seen before, Claude Code first asks you to trust it.
 3. When Opus writes `.harness/plans/<slug>.md`, the plan appears on the board. Change any task's agent from its dropdown (this edits the plan file), then press **Start**.
 4. Each agent tab shows that agent's live headless stream. Use **Take over** to resume that agent's own session in a real terminal while the engine holds its lane, and **Hand back** to return it.
-5. Paused tasks land in **Needs you**, with a guidance box and an agent picker; you also get a Windows notification. When every task is done and reviewed, **Merge to main** appears.
+5. Paused tasks land in **Needs you**, with a guidance box and an agent picker; you also get a Windows notification. A task that needs files outside its write scope also gets an **Allow files** button (see [Write scope](#write-scope)). When every task is done and reviewed, **Merge to main** appears.
 
 ## Status (2026-10-21)
 
@@ -71,8 +103,9 @@ npm install
 npm run ho -w packages/engine -- doctor
 npm run ho -w packages/engine -- validate .harness/plans/x.md --repo <repo>
 npm run ho -w packages/engine -- run .harness/plans/x.md --repo <repo>
-npm run ho -w packages/engine -- status|merge|discard .harness/plans/x.md --repo <repo>rge .harness/plans/x.md --repo <repo>
-npm run ho -w packages/engine -- resume .harness/plans/x.md T3 --guidance "..." [--agent codex] --repo <repo>
+npm run ho -w packages/engine -- status|merge|discard .harness/plans/x.md --repo <repo>
+npm run ho -w packages/engine -- resume .harness/plans/x.md T3 --guidance "..." [--agent codex] [--allow-scope] --repo <repo>
+npm run ho -w packages/engine -- review .harness/plans/x.md codex approve|retry [--allow-scope] --repo <repo>
 ```
 
 State lives in `~/.harnessorch/` (SQLite, logs). Worktrees live in `<repo>/../.harness-wt/`.

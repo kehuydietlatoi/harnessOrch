@@ -156,7 +156,7 @@ export function App() {
           <TaskPanel snap={snap} task={task} planFile={planFile} initialTab={initialHash.get("ptab")} onClose={() => setSelected(null)} onError={setError} onChanged={refreshSnap} />}
         {reviewAgent && snap && planFile &&
           <ReviewPanel snap={snap} agent={reviewAgent} planFile={planFile} onClose={() => setSelected(null)} onSelectTask={setSelected}
-            onReview={async (action) => { if (await guard(api.call("plan:review", planFile, reviewAgent, action)) !== undefined) { setSelected(null); void refreshSnap(); } }} />}
+            onReview={async (action, allowScope) => { if (await guard(api.call("plan:review", planFile, reviewAgent, action, allowScope)) !== undefined) { setSelected(null); void refreshSnap(); } }} />}
       </main>
 
       <Drawer term={term} snap={snap} events={events} repo={repo} planFile={planFile} blockedReviews={blockedReviews.length} />

@@ -11,7 +11,7 @@ export function ReviewPanel(props: {
   planFile: string;
   onClose: () => void;
   onSelectTask: (id: string) => void;
-  onReview: (action: "approve" | "retry") => void;
+  onReview: (action: "approve" | "retry", allowScope?: boolean) => void;
 }) {
   const [tab, setTab] = useState<Tab>("rounds");
   const [diff, setDiff] = useState<string | null>(null);
@@ -54,10 +54,16 @@ export function ReviewPanel(props: {
         <div className="resume-box">
           <div className="resume-title">⏸ This review needs you</div>
           {(st.why ?? why) && <p className="note">{st.why ?? why}</p>}
-          <p className="muted small-text">Read the reviewer's notes and the diff, then decide: accept the work as it is, or let a fresh review run.</p>
+          {st.scopeRequest.length > 0 ? <>
+            <p className="muted small-text">{props.agent}'s fix changed files outside the write scope. Its edits are kept on the stash.</p>
+            <ul className="plain">{st.scopeRequest.map((p) => <li key={p}><code>{p}</code></li>)}</ul>
+          </> : <p className="muted small-text">Read the reviewer's notes and the diff, then decide: accept the work as it is, or let a fresh review run.</p>}
           <div className="row">
-            <button onClick={() => props.onReview("retry")} title="Run the review again (after you fixed something yourself, for example)">Review again</button>
-            <button className="primary" onClick={() => props.onReview("approve")} title="Accept the work as it is; the plan can then be merged">Approve anyway</button>
+            {st.scopeRequest.length > 0 && <button className="primary" onClick={() => props.onReview("retry", true)}
+              title="Add these files to the write scope, finish the fix with its edits restored, then review again">Allow files and continue</button>}
+            <button onClick={() => props.onReview("retry")} title={st.scopeRequest.length ? "Revert these files and let the fix continue inside the write scope" : "Run the review again (after you fixed something yourself, for example)"}>
+              {st.scopeRequest.length ? "Revert them and continue" : "Review again"}</button>
+            <button className={st.scopeRequest.length ? "" : "primary"} onClick={() => props.onReview("approve")} title="Accept the work as it is; the plan can then be merged">Approve anyway</button>
           </div>
         </div>
       )}

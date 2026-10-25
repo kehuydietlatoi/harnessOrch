@@ -5,13 +5,13 @@
  */
 export type TaskState =
   | "queued" | "working" | "checking" | "merging" | "escalating"
-  /** Needs you: a blocked question, attempts exhausted, or an engine error. */
+  /** Needs you: a blocked question, attempts exhausted, files outside the write scope, or an engine error. */
   | "waiting"
   | "stopped" | "interrupted" | "done" | "skipped";
 
 export type TaskEvent =
   | "dispatch" | "turnFinished" | "failed" | "blocked" | "attemptsExhausted" | "usageLimit"
-  | "passed" | "merged" | "retry" | "human" | "error"
+  | "passed" | "merged" | "retry" | "human" | "error" | "outOfScope"
   | "resume" | "restartClean" | "skip" | "stop" | "appClosed";
 
 /** States with engine work in flight. */
@@ -32,7 +32,8 @@ export const TRANSITIONS: { readonly [S in TaskState]: { readonly [E in TaskEven
     turnFinished: "checking", failed: "working", blocked: "escalating", attemptsExhausted: "escalating",
     usageLimit: "queued", stop: "stopped", appClosed: "interrupted", ...crash,
   },
-  checking: { passed: "merging", failed: "working", attemptsExhausted: "escalating", stop: "stopped", appClosed: "interrupted", ...crash },
+  // `outOfScope`: the agent changed files it says it needs outside its write scope; only a human can widen the scope.
+  checking: { passed: "merging", failed: "working", attemptsExhausted: "escalating", outOfScope: "waiting", stop: "stopped", appClosed: "interrupted", ...crash },
   // `stop` here is applied only once the merge has failed: a stop never interrupts git mid-merge.
   // `merged` on appClosed: the merge landed before the app closed.
   merging: { merged: "done", failed: "working", attemptsExhausted: "escalating", stop: "stopped", appClosed: "interrupted", ...crash },

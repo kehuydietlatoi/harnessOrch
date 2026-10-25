@@ -200,14 +200,14 @@ handle("plan:setAgent", (file: string, taskId: string, agent: string | null) => 
   return true;
 });
 handle("plan:setField", (file: string, taskId: string, key: EditableField, value: string | null) => {
-  if (!["model", "effort"].includes(key)) throw new Error(`cannot edit ${key} here`);
+  if (!["model", "effort", "images"].includes(key)) throw new Error(`cannot edit ${key} here`);
   writeFileSync(file, setTaskField(readFileSync(file, "utf8"), taskId, key, value?.trim() || undefined));
   return true;
 });
-handle("plan:resume", async (file: string, taskId: string, guidance: string | null, agent: AgentId | null) => {
+handle("plan:resume", async (file: string, taskId: string, guidance: string | null, agent: AgentId | null, allowScope = false) => {
   const r = runnerFor(file);
   await r.prepare();
-  r.resumeTask(taskId, { ...(guidance ? { guidance } : {}), ...(agent ? { agent } : {}) });
+  r.resumeTask(taskId, { ...(guidance ? { guidance } : {}), ...(agent ? { agent } : {}), allowScope });
   if (!r.running) void r.run();
   return true;
 });
@@ -218,10 +218,10 @@ handle("plan:skip", async (file: string, taskId: string) => {
   if (!r.running) void r.run();
   return true;
 });
-handle("plan:review", async (file: string, agent: string, action: "approve" | "retry") => {
+handle("plan:review", async (file: string, agent: string, action: "approve" | "retry", allowScope = false) => {
   const r = runnerFor(file);
   await r.prepare();
-  r.resolveReview(agent, action);
+  r.resolveReview(agent, action, { allowScope });
   if (!r.running) void r.run();
   return true;
 });

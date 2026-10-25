@@ -4,12 +4,13 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { DEFAULT_CONFIG, type AgentRef, type EngineConfig } from "../config.js";
 import { runTurn as defaultRunTurn, type AgentId, type TurnRequest, type TurnResult } from "../agents/turn.js";
 import { parseWorkerResult, renderBrief, renderFixPrompt, renderHandoff, RESULT_SCHEMA, type WorkerResult } from "../brief/brief.js";
-import { changedPaths, checksPassed, formatCheckFailures, runChecks as defaultRunChecks, scopeViolations, type CheckResult } from "../checks/checks.js";
+import { changedPaths, checksPassed, formatCheckFailures, hverifyCommand, runChecks as defaultRunChecks, scopeViolations, type CheckResult } from "../checks/checks.js";
 import { lockPathsOverlap } from "../git/path-locks.js";
 import { budgetWatcher, effectiveTokens, type BudgetWatcher } from "../ledger/effective.js";
 import { orchHome, projectId } from "../ledger/telemetry.js";
+import { applyGrant, hasGrant, SAFE_GRANTS, type Grant } from "./grants.js";
 import { DECISION_SCHEMA, parseDecision, renderConflictPrompt, renderDecisionPrompt, type Decision } from "../orchestrator/orchestrator.js";
-import { markTask, parsePlan, validatePlan, type Plan, type PlanTask, type TaskMark } from "../plan/plan.js";
+import { markTask, parsePlan, setTaskChecks, setTaskField, validatePlan, type Plan, type PlanTask, type TaskMark } from "../plan/plan.js";
 import { parseVerdict, renderReviewPrompt, VERDICT_SCHEMA } from "../review/review.js";
 import { blockedBy, nextDispatches, planFinished, type SchedTask } from "../scheduler/scheduler.js";
 import { listSkills, selectSkills, type Skill, type SkillRole } from "../skills/skills.js";
@@ -58,6 +59,30 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 /** Failure details kept on events for the task panel: enough to read, small enough for the store. */
 const clipDetails = (s: string): string => (s.length > 4000 ? `${s.slice(0, 4000)}\n… (truncated)` : s);
+
+/** The plan's write scope plus the paths the human allowed on top of it. */
+function withExtraScope(t: PlanTask, row: TaskRow | undefined): PlanTask {
+  const extra = row?.extraScope.filter((p) => !t.writeScope.includes(p)) ?? [];
+  return extra.length ? { ...t, writeScope: [...t.writeScope, ...extra] } : t;
+}
+
+/** A path from an agent's files_changed, as git status spells it relative to the work tree. */
+function relativeToLane(path: string, lanePath: string): string {
+  const p = path.replaceAll("\\", "/");
+  const base = `${lanePath.replaceAll("\\", "/").replace(/\/$/, "")}/`;
+  return (p.toLowerCase().startsWith(base.toLowerCase()) ? p.slice(base.length) : p).replace(/^\.\//, "");
+}
+
+/**
+ * The engine's verdict on a finished turn. `outOfScope`: files the agent changed outside its
+ * write scope and says it needs (listed in files_changed); they stay in the tree until a human decides.
+ * `reverted`: out-of-scope edits the engine undid on its own.
+ */
+interface Verification {
+  failure: { reason: string; details: string } | null;
+  outOfScope: string[];
+  reverted: string[];
+}
 
 /** Why a finished task could not be accepted yet. `notMerged`: its commit never reached the plan branch. */
 interface MergeFailure {
@@ -406,11 +431,13 @@ ${r.output}` });
     this.inflight.set(key, p);
   }
 
+  /** A plan task with the paths the human allowed added to its write scope. */
   private task(id: string): PlanTask {
     const t = this.plan.tasks.find((x) => x.id === id);
     if (!t) throw new Error(`unknown task ${id}`);
-    return t;
+    return withExtraScope(t, this.store.task(this.key, id));
   }
+
 
   /** Ordered agent choices for a task: reassignment, explicit override, then the role's routing. */
   candidates(t: PlanTask): AgentRef[] {
@@ -421,6 +448,7 @@ ${r.output}` });
       const routed = [...this.cfg.routing[t.role], ...this.cfg.routing.implement, ...this.cfg.routing.hard].find((r) => r.agent === t.agent);
       return [{ ...(routed ?? { agent: t.agent }), ...(t.model ? { model: t.model } : {}), ...effort }];
     }
+
     return this.cfg.routing[t.role].map((r) => ({ ...r, ...effort }));
   }
 
@@ -435,7 +463,7 @@ ${r.output}` });
   private schedTasks(): SchedTask[] {
     const rows = new Map(this.store.tasks(this.key).map((r) => [r.id, r]));
     return this.plan.tasks.map((t) => ({
-      id: t.id, dependsOn: t.dependsOn, writeScope: t.writeScope, candidates: this.candidates(t),
+      id: t.id, dependsOn: t.dependsOn, writeScope: withExtraScope(t, rows.get(t.id)).writeScope, candidates: this.candidates(t),
       status: rows.get(t.id)?.status ?? (t.done ? "done" : "queued"),
     }));
   }
@@ -587,6 +615,7 @@ ${r.output}` });
       const parked = resumedByHuman ? await g.findStash(lane.path, this.parkLabel(t)) : null;
       if (parked && await g.applyStash(lane.path, parked)) {
         this.say({ type: "info", message: `${t.id}: restored its parked work` });
+        await this.revertDeclined(t.id, lane);
         continuing = hasSession;
       }
     }
@@ -623,8 +652,10 @@ ${r.output}` });
       else if (result.status === "failed") failure = { reason: "the agent reported failure", details: result.summary };
       else {
         this.setState(t.id, "turnFinished");
-        failure = await this.verify(t, lane, ctl.signal);
+        const verified = await this.verify(t, lane, result.files_changed, ctl.signal);
         if (ctl.signal.aborted) return this.stopParked(t, lane);
+        if (verified.outOfScope.length) return this.pauseOutOfScope(t, lane, verified.outOfScope);
+        failure = verified.failure;
         if (!failure) {
           this.setState(t.id, "passed");
           const merged = await this.complete(t, lane, result);
@@ -663,28 +694,64 @@ ${r.output}` });
   /** Tasks a human resumed on the same agent: restore their parked work. */
   private readonly resumed = new Set<string>();
 
-  /** The engine's own definition of done: scope, then checks. */
-  private async verify(t: PlanTask, lane: Lane, signal?: AbortSignal): Promise<{ reason: string; details: string } | null> {
+  /**
+   * The engine's own definition of done: scope, then checks. Out-of-scope edits the agent
+   * listed in files_changed are its work, not noise: they wait for a human instead of being
+   * reverted, unless the human already declined them.
+   */
+  private async verify(t: PlanTask, lane: Lane, filesChanged: readonly string[], signal?: AbortSignal): Promise<Verification> {
     const paths = await changedPaths(lane.path);
     // Manifests are always in scope: agents may add dev dependencies on their own.
     const violations = scopeViolations(paths, [...t.writeScope, ...MANIFEST_GLOBS], this.protectedPaths);
+    const claimed = new Set(filesChanged.map((p) => relativeToLane(p, lane.path)));
+    const declined = this.declinedScope.get(t.id);
+    const outOfScope = violations.filter((v) => v.reason === "outside write_scope" && claimed.has(v.path) && !declined?.has(v.path)).map((v) => v.path);
+    const noise = violations.filter((v) => !outOfScope.includes(v.path));
     // Revert out-of-scope edits ourselves instead of spending a turn asking the worker to.
     let reverted = "";
-    if (violations.length) {
-      await g.revertPaths(lane.path, violations.map((v) => v.path));
-      reverted = `The engine reverted changes outside your write scope (${t.writeScope.join(", ")}): ${violations.map((v) => `${v.path} (${v.reason})`).join(", ")}.`;
+    if (noise.length) {
+      await g.revertPaths(lane.path, noise.map((v) => v.path));
+      reverted = `The engine reverted changes outside your write scope (${t.writeScope.join(", ")}): ${noise.map((v) => `${v.path} (${v.reason})`).join(", ")}.`;
       this.say({ type: "info", message: `${t.id}: ${reverted}` });
     }
+    const revertedPaths = noise.map((v) => v.path);
+    if (outOfScope.length) return { failure: null, outOfScope, reverted: revertedPaths };
     const depsProblem = await this.guardDependencies(lane, paths, t.deps);
     if (depsProblem) {
       reverted = [reverted, depsProblem].filter(Boolean).join("\n");
       this.say({ type: "info", message: `${t.id}: ${depsProblem}` });
     }
-    const checks = t.checks.length ? t.checks : this.plan.header.checks;
-    if (!checks.length) return null;
+    const checks = this.checksOf(t);
+    const ok: Verification = { failure: null, outOfScope: [], reverted: revertedPaths };
+    if (!checks.length) return ok;
     const results = await this.deps.runChecks(checks, lane.path, join(this.stateDir, "checks"), undefined, signal);
-    if (checksPassed(results)) return null;
-    return { reason: "checks failed", details: [reverted, formatCheckFailures(results)].filter(Boolean).join("\n\n") };
+    if (checksPassed(results)) return ok;
+    return { ...ok, failure: { reason: "checks failed", details: [reverted, formatCheckFailures(results)].filter(Boolean).join("\n\n") } };
+  }
+
+  /** Out-of-scope paths the human declined, per task (or `review-<agent>`): reverted without asking again. */
+  private readonly declinedScope = new Map<string, Set<string>>();
+
+  private decline(key: string, paths: readonly string[]): void {
+    const set = this.declinedScope.get(key) ?? new Set<string>();
+    for (const p of paths) set.add(p);
+    this.declinedScope.set(key, set);
+  }
+
+  /** Revert restored edits to paths the human declined, so the agent does not build on them. */
+  private async revertDeclined(key: string, lane: Lane): Promise<void> {
+    const declined = this.declinedScope.get(key);
+    if (!declined?.size) return;
+    const paths = (await changedPaths(lane.path)).filter((p) => declined.has(p));
+    if (paths.length) await g.revertPaths(lane.path, paths);
+  }
+
+  /** The agent needs files outside its write scope: keep the edits on the stash and ask the human. */
+  private async pauseOutOfScope(t: PlanTask, lane: Lane, paths: string[]): Promise<void> {
+    this.store.updateTask(this.key, t.id, { scopeRequest: paths });
+    await this.park(t, lane);
+    this.pause(t.id, "outOfScope", `the agent changed files outside its write scope: ${paths.join(", ")}`,
+      `Write scope: ${t.writeScope.join(", ")}\nAllow the files to keep these edits, or resume without allowing them and the engine reverts them.`);
   }
 
   /**
@@ -815,16 +882,33 @@ ${r.output}` });
     if (!row?.orchestrated) {
       this.store.updateTask(this.key, t.id, { orchestrated: true });
       const decision = await this.decide(t, agent, reason, details, attempts, history);
-      if (decision && decision.action !== "human") {
+      if (decision?.action === "amend") {
+        const from = this.checksOf(t);
+        // An amend replaces checks that cannot run; it never drops one.
+        if (decision.checks && decision.checks.length >= from.length) {
+          this.amendChecks(t.id, decision.checks);
+          this.say({ type: "info", message: `${t.id}: orchestrator changed the checks: ${from.join("; ") || "(plan checks)"} → ${decision.checks.join("; ")}` });
+          this.guidance.set(t.id, `${decision.guidance}\n\nThe engine now runs these checks for this task:\n${decision.checks.map((c) => `- \`${hverifyCommand(c)}\``).join("\n")}`);
+          this.continuing.add(t.id);
+          this.setState(t.id, "retry", { attempts: 0 }, { note: "orchestrator: amended the checks" });
+          return;
+        }
+        details = `The orchestrator proposed checks that drop one (${decision.checks?.join("; ")}); the engine refused.\n\n${details}`;
+      } else if (decision && decision.action !== "human") {
         this.guidance.set(t.id, decision.guidance);
-        if (decision.action === "reassign" && decision.agent && decision.agent !== agent) {
-          this.reassign(t, decision.agent);
+        // Safe grants are applied here, without asking you; a grant that only works on one agent moves the task there.
+        const granted = (decision.grant ?? []).filter((x) => !hasGrant(t, x));
+        for (const x of granted) this.grantTask(t, x);
+        const needed = granted.map((x) => SAFE_GRANTS[x].agent as string).find((a) => a !== (decision.agent || agent));
+        const target = decision.action === "reassign" && decision.agent ? decision.agent : needed ?? agent;
+        if (target !== agent) {
+          this.reassign(t, target);
           await this.park(t, lane);
         } else this.continuing.add(t.id);
-        this.setState(t.id, "retry", { attempts: 0 }, { note: `orchestrator: ${decision.action}${decision.agent ? ` → ${decision.agent}` : ""}` });
+        const grantNote = granted.length ? ` + granted ${granted.join(", ")}` : "";
+        this.setState(t.id, "retry", { attempts: 0 }, { note: `orchestrator: ${decision.action}${target !== agent ? ` → ${target}` : ""}${grantNote}` });
         return;
-      }
-      if (decision) details = `${decision.guidance}\n\n${details}`;
+      } else if (decision) details = `${decision.guidance}\n\n${details}`;
     }
     await this.park(t, lane);
     this.pause(t.id, "human", `${reason}: ${details.split("\n")[0].slice(0, 200)}`, details);
@@ -833,10 +917,42 @@ ${r.output}` });
   /** Tasks the orchestrator sent back to the same agent: resume in place, keep the work tree. */
   private readonly continuing = new Set<string>();
 
+  /** The checks a task runs: its own, else the plan's. */
+  private checksOf(t: PlanTask): string[] {
+    return t.checks.length ? t.checks : this.plan.header.checks;
+  }
+
+  /** Replace a task's checks in memory and in the plan file, so a restart keeps them. */
+  private amendChecks(taskId: string, checks: string[]): void {
+    const t = this.plan.tasks.find((x) => x.id === taskId);
+    if (t) t.checks = checks;
+    try {
+      const text = readFileSync(this.planPath, "utf8");
+      const next = setTaskChecks(text, taskId, checks);
+      if (next !== text) writeFileSync(this.planPath, next);
+    } catch (error) {
+      this.say({ type: "info", message: `could not update plan file: ${(error as Error).message}` });
+    }
+  }
+
+  /** Switch a safe capability on for a task, in memory and in the plan file (the loop re-reads the file each pass). */
+  private grantTask(t: PlanTask, grant: Grant): void {
+    applyGrant(t, grant);
+    try {
+      const text = readFileSync(this.planPath, "utf8");
+      const next = setTaskField(text, t.id, grant, "true");
+      if (next !== text) writeFileSync(this.planPath, next);
+    } catch (error) {
+      this.say({ type: "info", message: `could not update plan file: ${(error as Error).message}` });
+    }
+    this.say({ type: "info", message: `${t.id}: granted ${SAFE_GRANTS[grant].describe} and retrying` });
+  }
+
   private async decide(t: PlanTask, agent: string, reason: string, details: string, attempts: number, history: string[]): Promise<Decision | null> {
     const available = AGENTS.filter((a) => !this.currentlyUnavailable().has(a));
+    const shell = process.platform === "win32" ? "cmd.exe on Windows" : "/bin/sh";
     for (const ref of this.orchestrators()) {
-      const prompt = renderDecisionPrompt({ planTitle: this.plan.header.title, task: t, agent, reason, details, attempts, history, availableAgents: available }, ref.agent === "opencode");
+      const prompt = renderDecisionPrompt({ planTitle: this.plan.header.title, task: t, checks: this.checksOf(t), shell, agent, reason, details, attempts, history, availableAgents: available }, ref.agent === "opencode");
       const r = await this.turn(ref, { cwd: this.planWorktree, prompt, taskId: t.id, phase: "orchestrate", session: "fresh", schema: DECISION_SCHEMA, readOnly: true });
       const d = parseDecision(r.structured, AGENTS);
       if (d && d.action !== "human") return d;
@@ -845,22 +961,39 @@ ${r.output}` });
     return null;
   }
 
-  private pause(taskId: string, event: "human" | "error", note: string, details?: string): void {
+  private pause(taskId: string, event: "human" | "error" | "outOfScope", note: string, details?: string): void {
     this.setState(taskId, event, { note }, { note, ...(details ? { details } : {}) });
     this.mark(taskId, { done: false, note: `⏸ needs you: ${note.slice(0, 120)}` });
     this.say({ type: "needs-you", taskId, message: `${taskId} paused: ${note}` });
   }
 
-  /** The human answered: retry the task, optionally with guidance or a different agent. */
-  resumeTask(taskId: string, opts: { guidance?: string; agent?: AgentId } = {}): void {
-    const t = this.task(taskId);
+  /**
+   * The human answered: retry the task, optionally with guidance or a different agent.
+   * `allowScope` answers an out-of-scope request: the files join the task's write scope;
+   * resuming without it declines them and the engine reverts them.
+   */
+  resumeTask(taskId: string, opts: { guidance?: string; agent?: AgentId; allowScope?: boolean } = {}): void {
     const row = this.store.task(this.key, taskId);
     // A blocked agent asked a question; resending the same task without an answer just buys the same question again.
     if (row?.status === "waiting" && row.note?.startsWith("the agent is blocked") && !opts.guidance?.trim() && (!opts.agent || opts.agent === row.agent)) {
       throw new Error(`${taskId} is waiting for an answer to its question. Write your answer in the box, pick another agent, or skip the task.`);
     }
     if (!row || !canTransition(row.status, "resume")) throw new Error(`${taskId} is ${row?.status ?? "unknown"}; only a task that needs you can be resumed`);
-    if (opts.guidance) this.guidance.set(taskId, opts.guidance);
+    let scopeNote = "";
+    if (row.scopeRequest.length) {
+      const files = row.scopeRequest.join(", ");
+      if (opts.allowScope) {
+        this.store.updateTask(this.key, taskId, { extraScope: [...new Set([...row.extraScope, ...row.scopeRequest])], scopeRequest: [] });
+        scopeNote = `The human allowed these files beyond your write scope: ${files}. Finish the task and report done.`;
+      } else {
+        this.decline(taskId, row.scopeRequest);
+        this.store.updateTask(this.key, taskId, { scopeRequest: [] });
+        scopeNote = `The human did not allow changes to ${files}; the engine reverted them. Finish within your write scope, or report blocked.`;
+      }
+    }
+    const t = this.task(taskId);
+    const guidance = [scopeNote, opts.guidance?.trim()].filter(Boolean).join("\n");
+    if (guidance) this.guidance.set(taskId, guidance);
     const current = row?.agent;
     if (opts.agent && opts.agent !== current) this.reassign(t, opts.agent);
     else this.resumed.add(taskId);
@@ -879,7 +1012,9 @@ ${r.output}` });
     this.guidance.delete(taskId);
     this.resumed.delete(taskId);
     this.continuing.delete(taskId);
-    this.setState(taskId, "restartClean", { attempts: 0, orchestrated: false, note: null }, { note: "restarted clean by you" });
+    this.declinedScope.delete(taskId);
+    // Paths you already allowed stay allowed; a pending request went with the parked edits.
+    this.setState(taskId, "restartClean", { attempts: 0, orchestrated: false, note: null, scopeRequest: [] }, { note: "restarted clean by you" });
     this.mark(taskId, { done: false });
     this.wakeUp();
   }
@@ -956,7 +1091,7 @@ ${r.output}` });
     const state = row?.status ?? "queued";
     if (FINAL.includes(state)) return;
     if (!canTransition(state, "skip")) throw new Error(`${taskId} is ${state}; stop it first`);
-    this.setState(taskId, "skip", { summary: "Skipped by you.", note: null }, { note: "skipped by you" });
+    this.setState(taskId, "skip", { summary: "Skipped by you.", note: null, scopeRequest: [] }, { note: "skipped by you" });
     this.mark(taskId, { done: true });
     this.wakeUp();
   }
@@ -1040,13 +1175,14 @@ ${r.output}` });
   private readonly reviewPhase = new Map<string, "reviewing" | "fixing">();
 
   /** Each author's review as the board shows it: running (reviewing or fixing), needing you, approved or not yet run. */
-  reviewStates(): Array<{ agent: string; state: "reviewing" | "fixing" | "needs-you" | "approved" | "pending"; reviewer: string | null; round: number; why: string | null; tasks: string[] }> {
+  reviewStates(): Array<{ agent: string; state: "reviewing" | "fixing" | "needs-you" | "approved" | "pending"; reviewer: string | null; round: number; why: string | null; tasks: string[]; scopeRequest: string[] }> {
     return this.authors().map((agent) => {
       const last = this.store.reviews(this.key, agent).at(-1);
       const phase = this.inflight.has(`review:${agent}`) ? this.reviewPhase.get(agent) : undefined;
       const state = phase ?? (this.reviewBlocked.has(agent) ? "needs-you" : this.reviewState(agent) === "approved" ? "approved" : "pending");
       const tasks = this.store.tasks(this.key).filter((r) => r.agent === agent && r.status === "done" && r.commitSha).map((r) => r.id);
-      return { agent, state, reviewer: last?.reviewer ?? null, round: last?.round ?? 0, why: this.reviewWhy.get(agent) ?? null, tasks };
+      return { agent, state, reviewer: last?.reviewer ?? null, round: last?.round ?? 0, why: this.reviewWhy.get(agent) ?? null, tasks,
+        scopeRequest: this.reviewScopeRequest.get(agent) ?? [] };
     });
   }
 
@@ -1056,11 +1192,28 @@ ${r.output}` });
     this.say({ type: "needs-you", message: `review of ${agent}'s work needs you: ${why}` });
   }
 
-  /** The human looked at a blocked review: approve as-is or let the engine review again. */
-  resolveReview(agent: string, action: "approve" | "retry"): void {
+  /**
+   * The human looked at a blocked review: approve as-is or let the engine review again.
+   * `allowScope` answers a review fix's out-of-scope request: the files join the write
+   * scope of the author's tasks; without it they are declined and reverted.
+   */
+  resolveReview(agent: string, action: "approve" | "retry", opts: { allowScope?: boolean } = {}): void {
     this.reviewBlocked.delete(agent);
     this.reviewWhy.delete(agent);
     this.reviewFailures.delete(agent);
+    const request = this.reviewScopeRequest.get(agent);
+    this.reviewScopeRequest.delete(agent);
+    if (request?.length) {
+      if (opts.allowScope) {
+        for (const row of this.store.tasks(this.key).filter((r) => r.agent === agent && r.status === "done")) {
+          this.store.updateTask(this.key, row.id, { extraScope: [...new Set([...row.extraScope, ...request])] });
+        }
+        this.reviewGuidance.set(agent, `The human allowed these files beyond your write scope: ${request.join(", ")}. Finish the fix and report done.`);
+      } else {
+        this.decline(`review-${agent}`, request);
+        this.reviewGuidance.set(agent, `The human did not allow changes to ${request.join(", ")}; the engine reverted them. Fix the findings within your write scope, or report blocked.`);
+      }
+    }
     if (action === "approve") {
       const round = (this.store.reviews(this.key, agent).at(-1)?.round ?? 0) + 1;
       this.store.addReview({ planId: this.key, agent, round, reviewer: "human", decision: "approve", notes: "approved by you" });
@@ -1116,6 +1269,14 @@ ${r.output}` });
   }
 
   private readonly fixCommits = new Map<string, string[]>();
+  /** Files a review fix changed outside the write scope, waiting for you, per author. */
+  private readonly reviewScopeRequest = new Map<string, string[]>();
+  /** What the next review fix is told about your answer, per author. */
+  private readonly reviewGuidance = new Map<string, string>();
+
+  private reviewFixLabel(agent: string): string {
+    return `harnessOrch ${this.id} review fixes (${agent})`;
+  }
 
   /** Fix review findings in the author's own lane session, then re-review. */
   private async reviewFix(agent: AgentId, tasks: PlanTask[], notes: string): Promise<void> {
@@ -1128,17 +1289,42 @@ ${r.output}` });
       checks: [...new Set(tasks.flatMap((t) => t.checks))], writeScope: [...new Set(tasks.flatMap((t) => t.writeScope))],
       readFirst: [], skills: [], images: false, deps: [...new Set(tasks.flatMap((t) => t.deps))], done: false, line: -1,
     };
+    // A fix that stopped for you earlier left its edits on the stash: continue from them.
+    const label = this.reviewFixLabel(agent);
+    const parked = await g.findStash(lane.path, label);
+    const restored = parked !== null && await g.applyStash(lane.path, parked);
+    if (restored) {
+      await g.dropStash(lane.path, label);
+      await this.revertDeclined(synthetic.id, lane);
+    }
+    const guidance = this.reviewGuidance.get(agent);
+    this.reviewGuidance.delete(agent);
+    const details = [restored ? "Your previous fix attempt is back in the work tree." : "", guidance ?? "", notes].filter(Boolean).join("\n\n");
     const ref = this.candidates(tasks[0]).find((c) => c.agent === agent) ?? { agent };
-    const r = await this.turn(ref, { cwd: lane.path, prompt: renderFixPrompt(synthetic, "the reviewer requested changes", notes, agent === "opencode"),
+    const r = await this.turn(ref, { cwd: lane.path, prompt: renderFixPrompt(synthetic, "the reviewer requested changes", details, agent === "opencode"),
       taskId: null, phase: "fix", session: "lane", schema: RESULT_SCHEMA });
     const result = parseWorkerResult(r.structured);
-    const failure = result?.status === "done" ? await this.verify(synthetic, lane) : { reason: "fix failed", details: result?.summary ?? r.text.slice(-500) };
-    if (failure) {
-      await g.stashWip(lane.path, `harnessOrch ${this.id} review fixes (${agent})`);
-      return this.blockReview(agent, `${agent} could not fix the findings: ${failure.reason}`);
+    if (result?.status !== "done") {
+      await g.stashWip(lane.path, label);
+      const said = result ? (result.questions.join(" ") || result.summary) : r.text.slice(-300);
+      const how = result?.status === "blocked" ? "is blocked" : result ? "reported failure" : "gave no valid result";
+      return this.blockReview(agent, `${agent} ${how} on the review findings${said.trim() ? `: ${said.trim().slice(0, 400)}` : ""}`);
+    }
+    const verified = await this.verify(synthetic, lane, result.files_changed);
+    if (verified.outOfScope.length) {
+      await g.stashWip(lane.path, label);
+      this.reviewScopeRequest.set(agent, verified.outOfScope);
+      return this.blockReview(agent, `${agent} changed files outside the write scope to fix the findings: ${verified.outOfScope.join(", ")}. Allow them to keep the fix.`);
+    }
+    if (verified.failure) {
+      await g.stashWip(lane.path, label);
+      return this.blockReview(agent, `${agent} could not fix the findings: ${verified.failure.reason}`);
     }
     const sha = await g.commitAll(lane.path, `Review fixes (${agent})`, agent);
-    if (!sha) return this.blockReview(agent, `${agent} made no changes for the review findings`);
+    if (!sha) {
+      const reverted = verified.reverted.length ? `; the engine reverted its edits outside the write scope (${verified.reverted.join(", ")})` : "";
+      return this.blockReview(agent, `${agent} made no changes for the review findings${reverted}`);
+    }
     const merged = await this.serialMerge(() => this.mergeLane(synthetic, lane));
     await this.syncLaneDeps(lane);
     if (merged !== true) return this.blockReview(agent, `review fixes did not merge: ${merged.reason}`);
@@ -1211,7 +1397,8 @@ ${r.output}` });
         const r = rows.get(t.id);
         const status: TaskState = r?.status ?? (t.done ? "done" : "queued");
         const route = this.candidates(t)[0];
-        return { ...t, status, next: STATE_INFO[status].next, phaseStartedAt: r?.phaseStartedAt ?? null,
+        return { ...withExtraScope(t, r), status, next: STATE_INFO[status].next, phaseStartedAt: r?.phaseStartedAt ?? null,
+          extraScope: r?.extraScope ?? [], scopeRequest: r?.scopeRequest ?? [],
           routedModel: r?.model ?? route?.model ?? null, routedEffort: route?.effort ?? null, assigned: r?.agent ?? this.candidates(t)[0]?.agent ?? null,
           note: r?.note ?? null, attempts: r?.attempts ?? 0, summary: r?.summary ?? null, decisions: r?.decisions ?? [], commits: this.commitsOf(t.id) };
       }),

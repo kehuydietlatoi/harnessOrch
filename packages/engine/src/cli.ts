@@ -17,14 +17,16 @@ const USAGE = `ho — harnessOrch engine
   ho validate <plan.md>                      check a plan file
   ho run <plan.md>                           run the plan until ready, paused or stopped
   ho status <plan.md>                        task board and token spend
-  ho resume <plan.md> <task> [--guidance "..."] [--agent codex]
+  ho resume <plan.md> <task> [--guidance "..."] [--agent codex] [--allow-scope]
                                              retry a paused task, then run
-  ho review <plan.md> <agent> approve|retry  settle a review that needs you
+  ho review <plan.md> <agent> approve|retry [--allow-scope]
+                                             settle a review that needs you
   ho merge <plan.md>                         merge the finished plan into its base branch
   ho discard <plan.md>                       throw the plan away: remove its worktrees and branches, no merge
   ho doctor                                  check the agent CLIs
 
-Options: --repo <dir> (default: current directory), --config <file.json>`;
+Options: --repo <dir> (default: current directory), --config <file.json>
+  --allow-scope: keep the files the agent changed outside its write scope (they join the scope)`;
 
 function loadConfig(path?: string): EngineConfig {
   if (!path) return DEFAULT_CONFIG;
@@ -84,7 +86,7 @@ async function doctor(): Promise<number> {
 async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: argv, allowPositionals: true,
-    options: { repo: { type: "string" }, config: { type: "string" }, guidance: { type: "string" }, agent: { type: "string" }, help: { type: "boolean", short: "h" } },
+    options: { repo: { type: "string" }, config: { type: "string" }, guidance: { type: "string" }, agent: { type: "string" }, "allow-scope": { type: "boolean" }, help: { type: "boolean", short: "h" } },
   });
   const [command, planArg, ...rest] = positionals;
   if (!command || values.help) {
@@ -132,7 +134,7 @@ async function main(argv: string[]): Promise<number> {
         if (!taskId) throw new Error("ho resume: missing <task>");
         if (values.agent && !AGENT_IDS.includes(values.agent as AgentId)) throw new Error(`unknown agent ${values.agent}`);
         await runner.prepare();
-        runner.resumeTask(taskId, { guidance: values.guidance, agent: values.agent as AgentId | undefined });
+        runner.resumeTask(taskId, { guidance: values.guidance, agent: values.agent as AgentId | undefined, allowScope: values["allow-scope"] });
         const status = await runner.run();
         printStatus(runner);
         return status === "ready" ? 0 : 2;
@@ -141,7 +143,7 @@ async function main(argv: string[]): Promise<number> {
         const [agent, action] = rest;
         if (!agent || (action !== "approve" && action !== "retry")) throw new Error("ho review <plan.md> <agent> approve|retry");
         await runner.prepare();
-        runner.resolveReview(agent, action);
+        runner.resolveReview(agent, action, { allowScope: values["allow-scope"] });
         const status = await runner.run();
         printStatus(runner);
         return status === "ready" ? 0 : 2;

@@ -52,7 +52,12 @@ export interface TaskView {
   goal: string;
   doneWhen: string[];
   checks: string[];
+  /** The plan's write_scope plus the paths you allowed. */
   writeScope: string[];
+  /** Paths you allowed beyond the plan's write_scope. */
+  extraScope: string[];
+  /** Paths the agent changed outside its write scope, waiting for you to allow them. */
+  scopeRequest: string[];
   readFirst: string[];
   skills: string[];
   images: boolean;
@@ -100,6 +105,8 @@ export interface ReviewState {
   round: number;
   why: string | null;
   tasks: string[];
+  /** Files the review fix changed outside the write scope, waiting for you to allow them. */
+  scopeRequest: string[];
 }
 
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;

@@ -35,7 +35,8 @@ export function parseVerdict(value: unknown): Verdict | null {
 
 /** Diff-only review of everything one agent contributed to the plan. */
 export function renderReviewPrompt(author: string, tasks: readonly PlanTask[], diff: string, fencedResult: boolean, skills: readonly string[] = []): string {
-  const scope = tasks.map((t) => `- ${t.id} ${t.title}: ${t.goal}${t.doneWhen.length ? ` Done when: ${t.doneWhen.join("; ")}` : ""}`).join("\n");
+  const scope = tasks.map((t) => `- ${t.id} ${t.title}: ${t.goal}${t.doneWhen.length ? ` Done when: ${t.doneWhen.join("; ")}` : ""}` +
+    `${t.checks.length ? ` Checks: ${t.checks.join("; ")}` : ""}`).join("\n");
   return [
     `Review the changes ${author} made for these tasks. You see only the diff, on purpose: judge it on its own.`,
     `## Tasks\n${scope}`,

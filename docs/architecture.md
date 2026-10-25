@@ -48,7 +48,7 @@ flowchart LR
 | `agents/turn.ts` | `runTurn`: one headless turn of one CLI with lean flags, parsed by a per-agent reducer into `TurnResult`. |
 | `brief/` | Task briefs (≤ 2k tokens), fix prompts, session handoffs, the worker result schema. |
 | `checks/` | Run check commands, filter output down to failures, find write-scope violations. |
-| `orchestrator/` | Decision prompt (retry, reassign or human) and merge-conflict prompt. |
+| `orchestrator/` | Decision prompt (retry, reassign, amend or human) and merge-conflict prompt. |
 | `review/` | Diff-only review prompt and verdict schema. |
 | `ledger/` | Effective-token weighting, the live `budgetWatcher`, pricing. |
 | `store/` | SQLite through `node:sqlite`: plans, tasks, lane sessions, runs, reviews, events. |
@@ -91,7 +91,8 @@ sequenceDiagram
   R->>L: stash leftovers, fast-forward onto plan branch, restore parked work if resumed
   R->>A: brief (or fix prompt) in the lane's session
   A-->>R: structured result (done / blocked / failed)
-  R->>L: revert out-of-scope and disallowed dependency edits
+  R->>L: revert unlisted out-of-scope and disallowed dependency edits
+  Note over R,L: out-of-scope files the agent listed in files_changed: park and wait for you (allow or revert)
   R->>L: run task checks (failures only)
   R->>L: commit
   R->>P: merge --no-ff, resolve conflicts via orchestrator if needed, run plan checks
@@ -101,7 +102,7 @@ sequenceDiagram
 
 If anything fails (no valid result, checks, merge, plan checks), the same session gets a fix prompt with the filtered failure and the task tries again. After `maxAttempts` (default 3) the task escalates. A `blocked` result escalates at once.
 
-**Escalation** (`escalate`) asks the orchestrator once per task, Codex first and then Opus. It can retry in place (same session, edits kept, only guidance sent), reassign to another agent (edits parked, fresh brief there), or hand the task to you. A task handed to you is `waiting`, with its edits parked on the stash.
+**Escalation** (`escalate`) asks the orchestrator once per task, Codex first and then Opus. It can retry in place (same session, edits kept, only guidance sent), reassign to another agent (edits parked, fresh brief there), amend the task's checks when one cannot run at all (written to the plan file and memory, then a retry in place; an amend that would drop a check is refused), or hand the task to you. A task handed to you is `waiting`, with its edits parked on the stash.
 
 ### Reviews
 
@@ -143,7 +144,7 @@ stateDiagram-v2
   checking --> escalating: attemptsExhausted
   checking --> stopped: stop
   checking --> interrupted: appClosed
-  checking --> waiting: error
+  checking --> waiting: outOfScope / error
   merging --> done: merged
   merging --> working: failed
   merging --> escalating: attemptsExhausted

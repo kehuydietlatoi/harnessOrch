@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { markTask, parsePlan, setTaskAgent, setTaskField, validatePlan } from "../src/plan/plan.js";
+import { markTask, parsePlan, setTaskAgent, setTaskChecks, setTaskField, validatePlan } from "../src/plan/plan.js";
 
 const PLAN = `---
 title: Enemy AI
@@ -96,6 +96,22 @@ describe("plan file", () => {
     expect(validatePlan(bad, { agents: ["codex", "claude", "opencode"] }).errors).toContain("task T1: effort must be one of low, medium, high, xhigh, max");
     const modelOnly = parsePlan(setTaskField(PLAN, "T1", "model", "x")).plan;
     expect(validatePlan(modelOnly, { agents: ["codex", "claude", "opencode"] }).warnings).toContain("task T1: model x is ignored without an agent");
+  });
+
+  it("sets and clears images", () => {
+    const on = setTaskField(PLAN, "T1", "images", "true");
+    expect(parsePlan(on).plan.tasks[0].images).toBe(true);
+    expect(parsePlan(setTaskField(on, "T1", "images", undefined)).plan.tasks[0].images).toBe(false);
+  });
+
+  it("replaces a task's checks, flow or block style, and adds them when missing", () => {
+    const amended = setTaskChecks(PLAN, "T1", ['E2E_ONLY="boss" npm run e2e', "npm test"]);
+    expect(amended).toContain(`  checks: ["E2E_ONLY=\\"boss\\" npm run e2e","npm test"]\n  \`\`\``);
+    expect(parsePlan(amended).plan.tasks.map((t) => t.checks)).toEqual([['E2E_ONLY="boss" npm run e2e', "npm test"], []]);
+    const block = PLAN.replace('  checks: ["npm test -- grid"]', "  checks:\n    - npm test -- grid\n    - npm run lint");
+    expect(parsePlan(setTaskChecks(block, "T1", ["npm test"])).plan.tasks[0]).toMatchObject({ checks: ["npm test"], writeScope: ["src/world/**"] });
+    const added = parsePlan(setTaskChecks(PLAN, "T2", ["npm run e2e:boss"])).plan.tasks[1];
+    expect(added).toMatchObject({ checks: ["npm run e2e:boss"], readFirst: ["src/world/grid.ts:1-80"] });
   });
 
   it("keeps CRLF line endings", () => {

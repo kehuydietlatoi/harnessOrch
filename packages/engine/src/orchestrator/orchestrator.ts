@@ -1,5 +1,6 @@
 import type { PlanTask } from "../plan/plan.js";
 import { estimateTokens } from "../brief/brief.js";
+import { GRANTS, SAFE_GRANTS, hasGrant, isGrant, type Grant } from "../engine/grants.js";
 
 /**
  * The orchestrator is never a supervisor: it is asked one question at a
@@ -8,26 +9,38 @@ import { estimateTokens } from "../brief/brief.js";
 export const DECISION_SCHEMA = {
   type: "object",
   properties: {
-    action: { type: "string", enum: ["retry", "reassign", "human"] },
+    action: { type: "string", enum: ["retry", "reassign", "amend", "human"] },
     agent: { type: "string", description: "For reassign: claude, codex or opencode." },
     guidance: { type: "string", description: "Concrete instructions for the next attempt, or the question for the human." },
+    checks: { type: "array", items: { type: "string" }, description: "For amend: the task's complete new check list. Otherwise []." },
+    grant: { type: "array", items: { type: "string", enum: GRANTS }, description: "For retry or reassign: safe capabilities the engine switches on for the task. Otherwise []." },
   },
-  required: ["action", "agent", "guidance"],
+  required: ["action", "agent", "guidance", "checks", "grant"],
   additionalProperties: false,
 } as const;
 
 export interface Decision {
-  action: "retry" | "reassign" | "human";
+  action: "retry" | "reassign" | "amend" | "human";
   agent?: string;
   guidance: string;
+  /** For amend: replaces the task's checks. */
+  checks?: string[];
+  /** For retry and reassign: safe capabilities the engine switches on before the next attempt. */
+  grant?: Grant[];
 }
 
 export function parseDecision(value: unknown, agents: readonly string[]): Decision | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
   const guidance = typeof v.guidance === "string" ? v.guidance.trim() : "";
-  if (v.action === "retry" && guidance) return { action: "retry", guidance };
-  if (v.action === "reassign" && typeof v.agent === "string" && agents.includes(v.agent)) return { action: "reassign", agent: v.agent, guidance };
+  const grants = Array.isArray(v.grant) ? [...new Set(v.grant.filter(isGrant))] : [];
+  const grant = grants.length ? { grant: grants } : {};
+  if (v.action === "retry" && guidance) return { action: "retry", guidance, ...grant };
+  if (v.action === "reassign" && typeof v.agent === "string" && agents.includes(v.agent)) return { action: "reassign", agent: v.agent, guidance, ...grant };
+  if (v.action === "amend" && guidance && Array.isArray(v.checks)) {
+    const checks = v.checks.filter((c): c is string => typeof c === "string").map((c) => c.trim()).filter(Boolean);
+    if (checks.length) return { action: "amend", guidance, checks };
+  }
   if (v.action === "human") return { action: "human", guidance: guidance || "needs a human decision" };
   return null;
 }
@@ -35,6 +48,10 @@ export function parseDecision(value: unknown, agents: readonly string[]): Decisi
 export interface Digest {
   planTitle: string;
   task: PlanTask;
+  /** The checks the task runs now (its own, else the plan's). */
+  checks: readonly string[];
+  /** What runs the checks, e.g. "cmd.exe on Windows". */
+  shell: string;
   agent: string;
   reason: string;
   /** Filtered check output, worker questions, or scope violations. */
@@ -52,18 +69,25 @@ function clip(text: string, maxTokens: number): string {
 export function renderDecisionPrompt(d: Digest, fencedResult: boolean): string {
   return [
     `You are the orchestrator of an automated plan "${d.planTitle}". One task is stuck; decide what happens next.`,
-    `## Task ${d.task.id}: ${d.task.title}\nGoal: ${d.task.goal}\nWrite scope: ${d.task.writeScope.join(", ")}${d.task.doneWhen.length ? `\nDone when: ${d.task.doneWhen.join("; ")}` : ""}`,
+    `## Task ${d.task.id}: ${d.task.title}\nGoal: ${d.task.goal}\nWrite scope: ${d.task.writeScope.join(", ")}${d.task.doneWhen.length ? `\nDone when: ${d.task.doneWhen.join("; ")}` : ""}` +
+      `\nChecks (run through ${d.shell}): ${d.checks.map((c) => `\`${c}\``).join(", ") || "none"}`,
     `## Situation\nAgent: ${d.agent}. Attempts: ${d.attempts}. Reason: ${d.reason}.`,
     d.history.length ? `## What the agent reported\n${d.history.map((h) => `- ${h}`).join("\n")}` : "",
     `## Details\n${clip(d.details, 2500)}`,
     "## Options\n- retry: same agent, with your concrete guidance (only if you see a clear fix)\n" +
       `- reassign: another agent (${d.availableAgents.join(", ")}) with guidance (when this agent is the problem)\n` +
+      "- amend: a check cannot run at all, for a reason no worker can fix within its write scope (shell syntax for another platform, a missing script or tool, a wrong path). " +
+      "Put the task's complete new check list in checks: keep every other check as it is, and make the replacement test the same thing. " +
+      "Never amend to make a real failure pass or to drop a check.\n" +
       "- human: the task needs a decision only a person can make (requirements, credentials, product choice)",
+    "## Grants\nThe engine can switch these on itself. Pass them in grant with retry (or reassign):\n" +
+      GRANTS.map((g) => `- ${g}: ${SAFE_GRANTS[g].describe}, runs on ${SAFE_GRANTS[g].agent}; currently ${hasGrant(d.task, g) ? "on" : "off"}`).join("\n") +
+      "\nWhen the blocker is a capability listed here that is off, choose retry with that grant. Do not choose human for it.",
     "Workers may add development dependencies themselves (npm install -D ...); tell them to when a missing dev library or tool is the blocker. " +
       "They cannot add production dependencies, change system tooling, use credentials, or edit outside their write scope, and neither can a retry: " +
       "if the blocker is one of those, choose human.",
     "You may read files in the repository to understand the problem, but do not edit anything.",
-    fencedResult ? 'End with one fenced ```json block: {"action": "...", "agent": "", "guidance": "..."}' : "End with the structured decision.",
+    fencedResult ? 'End with one fenced ```json block: {"action": "...", "agent": "", "guidance": "...", "checks": [], "grant": []}' : "End with the structured decision.",
   ].filter(Boolean).join("\n\n");
 }
 

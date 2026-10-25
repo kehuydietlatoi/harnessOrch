@@ -227,8 +227,8 @@ export function setTaskAgent(markdown: string, id: string, agent: string | undef
 }
 
 /** The task fields the board may edit. */
-export type EditableField = "agent" | "model" | "effort";
-const FIELD_ORDER: readonly EditableField[] = ["agent", "model", "effort"];
+export type EditableField = "agent" | "model" | "effort" | "images";
+const FIELD_ORDER: readonly EditableField[] = ["agent", "model", "effort", "images"];
 
 /**
  * Set (or clear, with `undefined`) one `key:` line inside a task's YAML block,
@@ -256,6 +256,36 @@ export function setTaskField(markdown: string, id: string, key: EditableField, v
     const after = [...FIELD_ORDER.slice(0, FIELD_ORDER.indexOf(key)).reverse(), "role"].map(lineOf).find((i) => i >= 0);
     lines.splice(after !== undefined ? after + 1 : open + 1, 0, `${indent}${key}: ${value}`);
   }
+  return lines.join(eol);
+}
+
+/**
+ * Replace a task's `checks:` with a flow list (JSON is valid YAML), including a
+ * block-style list's item lines. Used when the orchestrator amends a check that
+ * cannot run. A task without `checks:` gets the line at the end of its block.
+ */
+export function setTaskChecks(markdown: string, id: string, checks: readonly string[]): string {
+  const eol = markdown.includes("\r\n") ? "\r\n" : "\n";
+  const lines = markdown.split(/\r?\n/);
+  const start = lines.findIndex((l) => HEADING.exec(l)?.[3] === id);
+  if (start < 0) throw new Error(`task ${id} not found in plan`);
+  let next = lines.findIndex((l, i) => i > start && HEADING.test(l));
+  if (next < 0) next = lines.length;
+  const open = lines.findIndex((l, i) => i > start && i < next && FENCE.test(l));
+  if (open < 0) throw new Error(`task ${id} has no yaml block`);
+  const close = lines.findIndex((l, i) => i > open && i < next && FENCE.test(l));
+  if (close < 0) throw new Error(`task ${id} yaml block is not closed`);
+  const indent = FENCE.exec(lines[open])![1];
+  const line = `${indent}checks: ${JSON.stringify(checks)}`;
+  const existing = lines.findIndex((l, i) => i > open && i < close && /^\s*checks\s*:/.test(l));
+  if (existing < 0) {
+    lines.splice(close, 0, line);
+    return lines.join(eol);
+  }
+  const depth = /^\s*/.exec(lines[existing])![0].length;
+  let end = existing + 1;
+  while (end < close && (/^\s*/.exec(lines[end])![0].length > depth || /^\s*- /.test(lines[end]))) end++;
+  lines.splice(existing, end - existing, line);
   return lines.join(eol);
 }
 

@@ -27,6 +27,7 @@ export function TaskPanel(props: {
     api.call<string>("plan:taskDiff", props.planFile, t.id).then(setDiff, (e: Error) => setDiff(`Could not load diff: ${e.message}`));
   }, [tab, diff, props.planFile, t.id]);
 
+  const editable = t.status === "queued" || NEEDS_YOU.includes(t.status);
   const runs = props.snap.runs.filter((r) => r.taskId === t.id);
   const tokens = runs.reduce((n, r) => n + r.effective, 0);
   const call = (p: Promise<unknown>) => p.then(props.onChanged, (e: Error) => props.onError(e.message));
@@ -42,7 +43,7 @@ export function TaskPanel(props: {
       </header>
 
       {NEEDS_YOU.includes(t.status) && <ResumeBox key={`${t.id}:${t.status}`} task={t}
-        onResume={(guidance, agent) => call(api.call("plan:resume", props.planFile, t.id, guidance, agent))}
+        onResume={(guidance, agent, allowScope) => call(api.call("plan:resume", props.planFile, t.id, guidance, agent, allowScope))}
         onRestartClean={() => call(api.call("plan:restartClean", props.planFile, t.id))}
         onSkip={() => call(api.call("plan:skip", props.planFile, t.id))} />}
       {STOPPABLE.includes(t.status) && <StopBox key={t.id} task={t} planFile={props.planFile}
@@ -60,23 +61,30 @@ export function TaskPanel(props: {
         {tab === "overview" && (
           <div className="overview">
             <Field label="Agent">
-              <select value={t.agent ?? ""} disabled={t.status !== "queued"}
+              <select value={t.agent ?? ""} disabled={!editable}
                 onChange={(e) => void call(api.call("plan:setAgent", props.planFile, t.id, e.target.value || null))}>
                 <option value="">{t.assigned ? `${t.assigned} (auto)` : "auto"}</option>
                 {AGENTS.map((a) => <option key={a} value={a}>{a}</option>)}
               </select>
-              {t.status !== "queued" && <span className="muted"> locked while {t.status}</span>}
+              {!editable && <span className="muted"> locked while {t.status}</span>}
             </Field>
             <Field label="Model">
-              <ModelPicker task={t} choices={props.snap.modelChoices}
+              <ModelPicker task={t} choices={props.snap.modelChoices} editable={editable}
                 onSet={(model) => void call(api.call("plan:setField", props.planFile, t.id, "model", model))} />
             </Field>
             <Field label="Thinking">
-              <select value={t.effort ?? ""} disabled={t.status !== "queued"}
+              <select value={t.effort ?? ""} disabled={!editable}
                 onChange={(e) => void call(api.call("plan:setField", props.planFile, t.id, "effort", e.target.value || null))}>
                 <option value="">{t.routedEffort && !t.effort ? `${t.routedEffort} (routing)` : "agent default"}</option>
                 {EFFORTS.map((x) => <option key={x} value={x}>{x}</option>)}
               </select>
+            </Field>
+            <Field label="Images">
+              <label>
+                <input type="checkbox" checked={t.images} disabled={!editable}
+                  onChange={(e) => void call(api.call("plan:setField", props.planFile, t.id, "images", e.target.checked ? "true" : null))} />
+                {" "}Codex image generation
+              </label>
             </Field>
             <Field label="Goal"><p>{t.goal}</p></Field>
             {t.summary && <Field label="Result"><p>{t.summary}</p></Field>}
@@ -125,20 +133,26 @@ const NEEDS_YOU_TITLE: Record<string, string> = {
 
 function ResumeBox(props: {
   task: TaskView;
-  onResume: (guidance: string | null, agent: string | null) => void;
+  onResume: (guidance: string | null, agent: string | null, allowScope: boolean) => void;
   onRestartClean: () => void;
   onSkip: () => void;
 }) {
   const [guidance, setGuidance] = useState("");
   const [agent, setAgent] = useState("");
   const t = props.task;
+
   // A blocked agent asked something: resuming without an answer would only buy the same question again.
   const asking = t.status === "waiting" && (t.note?.startsWith("the agent is blocked") ?? false);
-  const canResume = !asking || guidance.trim().length > 0 || agent !== "";
+  const canResume = (!asking || guidance.trim().length > 0 || agent !== "");
+  // The agent changed files outside its write scope and says it needs them.
+  const scope = t.scopeRequest;
   return (
     <div className="resume-box">
-      <div className="resume-title">⏸ {asking ? "The agent asks" : NEEDS_YOU_TITLE[t.status]}</div>
-      {t.note && <p className="note">{asking ? t.note.replace(/^the agent is blocked:\s*/, "") : t.note}</p>}
+      <div className="resume-title">⏸ {asking ? "The agent asks" : scope.length ? "The agent needs files outside its write scope" : NEEDS_YOU_TITLE[t.status]}</div>
+      {scope.length > 0 ? <>
+        <ul className="plain">{scope.map((p) => <li key={p}><code>{p}</code></li>)}</ul>
+        <p className="muted small">Its edits are kept on the stash. Allow the files to keep them, or resume without them and the engine reverts them.</p>
+      </> : t.note && <p className="note">{asking ? t.note.replace(/^the agent is blocked:\s*/, "") : t.note}</p>}
       <p className="muted small">{t.next}</p>
       <textarea placeholder={asking ? "Your answer (required to resume on the same agent)" : "Guidance for the agent (optional)"}
         value={guidance} onChange={(e) => setGuidance(e.target.value)} />
@@ -150,8 +164,10 @@ function ResumeBox(props: {
           <option value="">same agent (keeps its work)</option>
           {AGENTS.filter((a) => a !== t.assigned).map((a) => <option key={a} value={a}>{a} (starts fresh)</option>)}
         </select>
-        <button className="primary" disabled={!canResume} title={canResume ? "Restore its edits and continue in the same session" : "Answer the agent's question first"}
-          onClick={() => props.onResume(guidance || null, agent || null)}>Resume</button>
+        {scope.length > 0 && <button className="primary" title="Add these files to the task's write scope, restore its edits and continue"
+          onClick={() => props.onResume(guidance || null, agent || null, true)}>Allow files and resume</button>}
+        <button className={scope.length ? "" : "primary"} disabled={!canResume} title={scope.length ? "Revert these files and continue inside the write scope" : canResume ? "Restore its edits and continue in the same session" : "Answer the agent's question first"}
+          onClick={() => props.onResume(guidance || null, agent || null, false)}>{scope.length ? "Resume without them" : "Resume"}</button>
       </div>
     </div>
   );
@@ -193,7 +209,7 @@ function StopBox(props: { task: TaskView; planFile: string; onStop: () => void; 
 }
 
 /** A task's model: the config's models for its agent, or any id typed in. Needs an explicit agent. */
-function ModelPicker(props: { task: TaskView; choices: Record<string, string[]>; onSet: (model: string | null) => void }) {
+function ModelPicker(props: { task: TaskView; choices: Record<string, string[]>; editable: boolean; onSet: (model: string | null) => void }) {
   const t = props.task;
   const [draft, setDraft] = useState(t.model ?? "");
   useEffect(() => { setDraft(t.model ?? ""); }, [t.model]);
@@ -204,7 +220,7 @@ function ModelPicker(props: { task: TaskView; choices: Record<string, string[]>;
   const commit = (): void => { if (draft.trim() !== (t.model ?? "")) props.onSet(draft.trim() || null); };
   return (
     <>
-      <input list={listId} value={draft} disabled={t.status !== "queued"} placeholder={t.routedModel ? `${t.routedModel} (routing)` : "agent default"}
+      <input list={listId} value={draft} disabled={!props.editable} placeholder={t.routedModel ? `${t.routedModel} (routing)` : "agent default"}
         onChange={(e) => setDraft(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") commit(); }} />
       <datalist id={listId}>{(props.choices[t.agent] ?? []).map((m) => <option key={m} value={m} />)}</datalist>
     </>

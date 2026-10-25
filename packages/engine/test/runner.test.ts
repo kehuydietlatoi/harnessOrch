@@ -7,6 +7,7 @@ import type { TurnRequest, TurnResult } from "../src/agents/turn.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { PlanRunner, type RunnerDeps, type RunnerEvent } from "../src/engine/runner.js";
 import { Store } from "../src/store/store.js";
+import { parsePlan } from "../src/plan/plan.js";
 
 const PASS = 'node -e "process.exit(0)"';
 const contains = (file: string, text: string): string =>
@@ -177,6 +178,93 @@ describe("plan runner", { timeout: 90_000 }, () => {
     expect(events.some((e) => e.type === "info" && /reverted changes outside your write scope/.test(e.message))).toBe(true);
   });
 
+  it("asks you before keeping out-of-scope files the agent says it needs; allowing them widens the scope", async () => {
+    const plan = writePlan(task("T1", "Needs more", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const events: RunnerEvent[] = [];
+    const { calls, runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.includes("the human answered")) return done("finished");
+      return { structured: { status: "done", summary: "fixed the core", files_changed: ["src/T1.txt", "./src/core.txt"], decisions: [], questions: [] },
+        write: { "src/T1.txt": "item", "src/core.txt": "fix", "src/noise.txt": "oops" } };
+    });
+    const r = runner(plan, runTurn, events);
+    // The core fix is not silently reverted while the task passes on what is left.
+    expect(await r.run()).toBe("paused");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "waiting", scopeRequest: ["src/core.txt"] });
+    expect(r.snapshot().tasks[0]?.scopeRequest).toEqual(["src/core.txt"]);
+    expect(events.some((e) => e.type === "needs-you" && /outside its write scope: src\/core\.txt/.test(e.message))).toBe(true);
+
+    r.resumeTask("T1", { allowScope: true });
+    expect(await r.run()).toBe("ready");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "done", extraScope: ["src/core.txt"], scopeRequest: [] });
+    expect(sh(repo, "show", "harness/demo:src/core.txt")).toBe("fix");
+    // Unlisted noise is still reverted without asking.
+    expect(sh(repo, "ls-tree", "-r", "--name-only", "harness/demo", "src")).not.toContain("noise.txt");
+    expect(calls.find((c) => c.prompt.includes("the human answered"))?.prompt).toContain("allowed these files beyond your write scope: src/core.txt");
+    expect(r.snapshot().tasks[0]?.writeScope).toEqual(["src/T1.txt", "src/core.txt"]);
+  });
+
+  it("resuming without allowing reverts the out-of-scope files and does not ask again", async () => {
+    const plan = writePlan(task("T1", "Declined", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const { calls, runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      return { structured: { status: "done", summary: "s", files_changed: ["src/T1.txt", "src/core.txt"], decisions: [], questions: [] },
+        write: { "src/T1.txt": "item", "src/core.txt": "fix" } };
+    });
+    const r = runner(plan, runTurn);
+    expect(await r.run()).toBe("paused");
+    r.resumeTask("T1");
+    expect(await r.run()).toBe("ready");
+    expect(sh(repo, "ls-tree", "-r", "--name-only", "harness/demo", "src")).not.toContain("core.txt");
+    expect(store.task(KEY(), "T1")).toMatchObject({ status: "done", extraScope: [], scopeRequest: [] });
+    expect(calls.find((c) => c.prompt.includes("the human answered"))?.prompt).toContain("did not allow changes to src/core.txt");
+  });
+
+  it("a review fix that needs out-of-scope files waits for you, keeps its edits, and lands once allowed", async () => {
+    const plan = writePlan(task("T1", "Reviewed", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    let reviews = 0;
+    let fixes = 0;
+    const { calls, runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) {
+        reviews++;
+        return reviews === 1 ? { structured: { decision: "request-changes", notes: "the item does nothing; fix the core", followups: [] } } : approve;
+      }
+      if (req.prompt.includes("reviewer requested changes")) {
+        fixes++;
+        // The second fix only finishes: its first attempt's edits must be back in the tree.
+        if (fixes === 2) return done("kept the core fix");
+        return { structured: { status: "done", summary: "fixed core", files_changed: ["src/core.txt"], decisions: [], questions: [] }, write: { "src/core.txt": "fix" } };
+      }
+      return { ...done(), write: { "src/T1.txt": "item" } };
+    });
+    const r = runner(plan, runTurn);
+    expect(await r.run()).toBe("paused");
+    expect(r.reviewStates()[0]).toMatchObject({ state: "needs-you", scopeRequest: ["src/core.txt"] });
+    expect(r.reviewStates()[0]?.why).toMatch(/outside the write scope.*src\/core\.txt/);
+
+    r.resolveReview("codex", "retry", { allowScope: true });
+    expect(await r.run()).toBe("ready");
+    expect(sh(repo, "show", "harness/demo:src/core.txt")).toBe("fix");
+    expect(store.task(KEY(), "T1")?.extraScope).toEqual(["src/core.txt"]);
+    const second = calls.filter((c) => c.prompt.includes("reviewer requested changes"))[1]!;
+    expect(second.prompt).toContain("Your previous fix attempt is back in the work tree.");
+    expect(second.prompt).toContain("allowed these files beyond your write scope: src/core.txt");
+  });
+
+  it("a blocked review fix tells you what the agent asked", async () => {
+    const plan = writePlan(task("T1", "Reviewed", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const { runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("Review the changes")) return { structured: { decision: "request-changes", notes: "n", followups: [] } };
+      if (req.prompt.includes("reviewer requested changes")) {
+        return { structured: { status: "blocked", summary: "s", files_changed: [], decisions: [], questions: ["Can the scope include src/core.txt?"] } };
+      }
+      return { ...done(), write: { "src/T1.txt": "item" } };
+    });
+    const r = runner(plan, runTurn);
+    expect(await r.run()).toBe("paused");
+    expect(r.reviewStates()[0]?.why).toBe("codex is blocked on the review findings: Can the scope include src/core.txt?");
+  });
+
   it("escalates a stuck task once, pauses it for the human, and keeps independent work going", async () => {
     const plan = writePlan([
       task("T1", "Stuck", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]\nchecks: ['node -e "process.exit(1)"']`),
@@ -233,6 +321,62 @@ describe("plan runner", { timeout: 90_000 }, () => {
     expect(retry.resumeSession).toBe("codex-session-1");
     expect(sh(repo, "show", "harness/demo:src/T1.txt")).toBe("first half");
     expect(sh(repo, "show", "harness/demo:src/T1b.txt")).toBe("second half");
+  });
+
+  it("lets the orchestrator amend a check that cannot run, in memory and in the plan file", async () => {
+    const plan = writePlan(task("T1", "Unrunnable check", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]\nchecks: ["no-such-tool-xyz --boss"]`));
+    const events: RunnerEvent[] = [];
+    const { calls, runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("You are the orchestrator")) {
+        return { structured: { action: "amend", agent: "", guidance: "the tool does not exist; the check now uses node", checks: ['node -e "process.exit(0)"'] } };
+      }
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.startsWith("# Task T1")) {
+        return { structured: { status: "blocked", summary: "s", files_changed: [], decisions: [], questions: ["no-such-tool-xyz is not installed; the check cannot run"] }, write: { "src/T1.txt": "work" } };
+      }
+      return done();
+    });
+    expect(await runner(plan, runTurn, events).run()).toBe("ready");
+    const orchestrator = calls.find((c) => c.prompt.startsWith("You are the orchestrator"))!;
+    expect(orchestrator.prompt).toContain("`no-such-tool-xyz --boss`");
+    const retry = calls.find((c) => c.prompt.includes("the orchestrator looked at your report"))!;
+    expect(retry.prompt).toContain('The engine now runs these checks for this task:');
+    expect(retry.prompt).toContain('process.exit(0)');
+    expect(sh(repo, "show", "harness/demo:src/T1.txt")).toBe("work");
+    expect(parsePlan(readFileSync(plan, "utf8")).plan.tasks[0].checks).toEqual(['node -e "process.exit(0)"']);
+    expect(events.some((e) => e.type === "info" && e.message.startsWith("T1: orchestrator changed the checks"))).toBe(true);
+  });
+
+  it("grants image generation itself when the orchestrator asks, and keeps it in the plan file", async () => {
+    const plan = writePlan(task("T1", "Icons", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]`));
+    const events: RunnerEvent[] = [];
+    const { calls, runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("You are the orchestrator")) return { structured: { action: "retry", agent: "", guidance: "image_gen is on now", checks: [], grant: ["images"] } };
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      if (req.prompt.startsWith("# Task T1")) {
+        return { structured: { status: "blocked", summary: "s", files_changed: [], decisions: [], questions: ["image_gen is not enabled"] } };
+      }
+      return { ...done(), write: { "src/T1.txt": "icon" } };
+    });
+    expect(await runner(plan, runTurn, events).run()).toBe("ready");
+    const orchestrator = calls.find((c) => c.prompt.startsWith("You are the orchestrator"))!;
+    expect(orchestrator.prompt).toContain("images: Codex image generation (image_gen)");
+    expect(calls.find((c) => c.prompt.startsWith("# Task T1"))?.imageGeneration).toBeFalsy();
+    expect(calls.find((c) => c.prompt.includes("the orchestrator looked at your report"))?.imageGeneration).toBe(true);
+    expect(parsePlan(readFileSync(plan, "utf8")).plan.tasks[0].images).toBe(true);
+    expect(events.some((e) => e.type === "info" && e.message.startsWith("T1: granted Codex image generation"))).toBe(true);
+  });
+
+  it("refuses an amend that drops a check and pauses for the human", async () => {
+    const plan = writePlan(task("T1", "Two checks", `agent: codex\ngoal: g\nwrite_scope: [src/T1.txt]\nchecks: ["node -e \\"process.exit(0)\\"", "no-such-tool-xyz"]`));
+    const { runTurn } = fakeTurns((req) => {
+      if (req.prompt.startsWith("You are the orchestrator")) return { structured: { action: "amend", agent: "", guidance: "drop it", checks: ['node -e "process.exit(0)"'] } };
+      if (req.prompt.startsWith("Review the changes")) return approve;
+      return { structured: { status: "blocked", summary: "s", files_changed: [], decisions: [], questions: ["the check cannot run"] } };
+    });
+    expect(await runner(plan, runTurn).run()).toBe("paused");
+    expect(store.task(KEY(), "T1")?.status).toBe("waiting");
+    expect(parsePlan(readFileSync(plan, "utf8")).plan.tasks[0].checks).toHaveLength(2);
   });
 
   it("falls back to the next agent when one hits its usage limit", async () => {
@@ -292,7 +436,7 @@ write_scope: [src/T1.txt]`));
     // The board sees the fix as running work, never as something that needs you.
     expect(states).toEqual(expect.arrayContaining(["reviewing", "fixing"]));
     expect(states).not.toContain("needs-you");
-    expect(r.reviewStates()).toEqual([{ agent: "codex", state: "approved", reviewer: "claude", round: 2, why: null, tasks: ["T1"] }]);
+    expect(r.reviewStates()).toEqual([{ agent: "codex", state: "approved", reviewer: "claude", round: 2, why: null, tasks: ["T1"], scopeRequest: [] }]);
     expect(store.reviews(KEY(), "codex").map((r) => r.decision)).toEqual(["request-changes", "approve"]);
     const fix = calls.find((c) => c.prompt.includes("reviewer requested changes"))!;
     expect(fix.resumeSession).toBe("codex-session-1");

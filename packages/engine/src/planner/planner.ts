@@ -59,7 +59,7 @@ skills: []            # optional project skills
 - **depends_on** only when a task truly needs another's result.
 - **role** picks the agent: \`implement\` → ${route(cfg.routing.implement)}; \`small\` (renames, config, docs, boilerplate, simple tests) → ${route(cfg.routing.small)}; \`hard\` (tricky bugs, core algorithms, risky refactors) → ${route(cfg.routing.hard)}. Claude time is scarce: use \`hard\` sparingly.
 - Add \`agent: claude|codex|opencode\` (and optionally \`model:\`) only when the user asks for a specific agent or model. \`effort: low|medium|high|xhigh|max\` sets the thinking level; leave it out unless the user asks.
-- Set \`images: true\` on asset tasks that need image generation (Codex).
+- Set \`images: true\` on every task that creates or redraws image files (icons, sprites, textures, effect sheets), including tasks that follow a repo art doc or the generate2dsprite / sprite-assets skill. Without it Codex's image tool is off and the task blocks. Such tasks run on Codex.
 - **skills**: name at most 2 project skills that fit, in the header (whole plan) or on a task. Available:
 - ${skillList}
 

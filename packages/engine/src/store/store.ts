@@ -34,6 +34,10 @@ export interface TaskRow {
   phaseStartedAt: string | null;
   /** When its latest agent turn started. */
   turnStartedAt: string | null;
+  /** Paths the human allowed beyond the plan's write_scope. */
+  extraScope: string[];
+  /** Paths the agent changed outside its write scope, parked until the human allows or declines them. */
+  scopeRequest: string[];
 }
 
 export interface SessionRow {
@@ -116,7 +120,7 @@ export class Store {
     const sessionColumns = this.db.prepare("PRAGMA table_info(sessions)").all() as Row[];
     if (!sessionColumns.some((c) => c.name === "thread_totals")) this.db.exec("ALTER TABLE sessions ADD COLUMN thread_totals TEXT");
     const taskColumns = this.db.prepare("PRAGMA table_info(tasks)").all() as Row[];
-    for (const col of ["phase_started_at", "turn_started_at"]) {
+    for (const col of ["phase_started_at", "turn_started_at", "extra_scope", "scope_request"]) {
       if (!taskColumns.some((c) => c.name === col)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${col} TEXT`);
     }
     // Statuses from before the task lifecycle. A row left "running" belonged to a process that is gone.
@@ -165,6 +169,7 @@ export class Store {
       attempts: Number(r.attempts), note: str(r.note), summary: str(r.summary),
       decisions: JSON.parse((r.decisions as string) || "[]") as string[], commitSha: str(r.commit_sha), orchestrated: Number(r.orchestrated) === 1,
       phaseStartedAt: str(r.phase_started_at), turnStartedAt: str(r.turn_started_at),
+      extraScope: JSON.parse((r.extra_scope as string) || "[]") as string[], scopeRequest: JSON.parse((r.scope_request as string) || "[]") as string[],
     }));
   }
 
@@ -178,6 +183,7 @@ export class Store {
       note: ["note", (v) => v], summary: ["summary", (v) => v], decisions: ["decisions", (v) => JSON.stringify(v ?? [])],
       commitSha: ["commit_sha", (v) => v], orchestrated: ["orchestrated", (v) => (v ? 1 : 0)],
       phaseStartedAt: ["phase_started_at", (v) => v], turnStartedAt: ["turn_started_at", (v) => v],
+      extraScope: ["extra_scope", (v) => JSON.stringify(v ?? [])], scopeRequest: ["scope_request", (v) => JSON.stringify(v ?? [])],
     };
     const set = (Object.keys(patch) as (keyof typeof patch)[]).filter((k) => patch[k] !== undefined && k in encode);
     if (!set.length) return;

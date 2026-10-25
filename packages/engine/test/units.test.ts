@@ -8,6 +8,7 @@ import { estimateTokens, parseWorkerResult, renderBrief, renderHandoff, RESULT_S
 import { scopeViolations } from "../src/checks/checks.js";
 import { filterCheckOutput } from "../src/checks/filter.js";
 import { budgetWatcher, cacheHitRate, effectiveTokens } from "../src/ledger/effective.js";
+import { parseDecision } from "../src/orchestrator/orchestrator.js";
 import { parsePlan } from "../src/plan/plan.js";
 import { blockedBy, nextDispatches, type SchedTask } from "../src/scheduler/scheduler.js";
 import { Store } from "../src/store/store.js";
@@ -15,6 +16,17 @@ import { Store } from "../src/store/store.js";
 import { filterCheckOutput as hverifyFilter } from "../assets/hverify.mjs";
 
 const j = (o: unknown): string => JSON.stringify(o);
+
+describe("orchestrator decisions", () => {
+  it("keeps known grants on retry and reassign and drops unknown ones", () => {
+    expect(parseDecision({ action: "retry", agent: "", guidance: "g", checks: [], grant: ["images", "root", "images"] }, ["codex"]))
+      .toEqual({ action: "retry", guidance: "g", grant: ["images"] });
+    expect(parseDecision({ action: "reassign", agent: "codex", guidance: "g", checks: [], grant: ["images"] }, ["codex"]))
+      .toEqual({ action: "reassign", agent: "codex", guidance: "g", grant: ["images"] });
+    expect(parseDecision({ action: "retry", agent: "", guidance: "g", checks: [], grant: ["root"] }, ["codex"])).toEqual({ action: "retry", guidance: "g" });
+    expect(parseDecision({ action: "human", agent: "", guidance: "g", checks: [], grant: ["images"] }, ["codex"])).toEqual({ action: "human", guidance: "g" });
+  });
+});
 
 describe("agent turn arguments", () => {
   it("builds the lean Claude worker measured in M0", () => {
