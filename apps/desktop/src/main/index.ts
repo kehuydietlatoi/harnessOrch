@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as pty from "node-pty";
 import {
-  AGENT_IDS, DEFAULT_CONFIG, PlanRunner, Store, planKey, cacheHitRate, orchHome, parsePlan, plannerArgs, setTaskAgent, setTaskField, type EditableField,
-  type AgentId, type RunnerEvent,
+  AGENT_IDS, DEFAULT_CONFIG, PlanRunner, Store, planKey, cacheHitRate, loadConfig, modelChoices, orchHome, parsePlan, plannerLaunch, resolvePlanner,
+  readUserConfig, saveUserConfig, setTaskAgent, setTaskField, userConfigPath, validateUserConfig, type EditableField,
+  type AgentId, type EngineConfig, type RunnerEvent, type UserConfig,
 } from "@harnessorch/engine";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -22,6 +23,15 @@ function saveSettings(s: Settings): void {
 
 let win: BrowserWindow | null = null;
 let settings: Settings = {};
+/** Built-in routing plus ~/.harnessorch/config.json; the Settings dialog edits the file. */
+let config: EngineConfig = DEFAULT_CONFIG;
+function reloadConfig(): void {
+  try { config = loadConfig(); } catch (error) {
+    config = DEFAULT_CONFIG;
+    send("runner:event", { file: null, event: { type: "info", message: `config.json ignored: ${error instanceof Error ? error.message : String(error)}` } });
+  }
+  for (const r of runners.values()) r.setConfig(config);
+}
 const store = new Store(join(orchHome(), "harness.db"));
 const runners = new Map<string, PlanRunner>();
 let plansWatcher: FSWatcher | null = null;
@@ -53,7 +63,7 @@ function runnerFor(file: string): PlanRunner {
   if (!settings.repo) throw new Error("open a repository first");
   let r = runners.get(file);
   if (r) return r;
-  r = new PlanRunner({ repo: settings.repo, planFile: file, store, config: DEFAULT_CONFIG });
+  r = new PlanRunner({ repo: settings.repo, planFile: file, store, config });
   r.on("event", (event: RunnerEvent) => {
     send("runner:event", { file, event });
     if (event.type === "needs-you") notify("harnessOrch needs you", event.message);
@@ -119,7 +129,7 @@ function spawnTerm(cmd: string, args: string[], cwd: string, cols: number, rows:
   const launch = shellLaunch(cmd, args);
   const proc = pty.spawn(launch.file, launch.args, {
     name: "xterm-256color", cols, rows, cwd,
-    env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "false", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" } as Record<string, string>,
+    env: { ...process.env, PWD: cwd, ENABLE_CLAUDEAI_MCP_SERVERS: "false", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" } as Record<string, string>,
   });
   proc.onData((data) => send("pty:data", { id, data }));
   proc.onExit(({ exitCode }) => {
@@ -132,13 +142,15 @@ function spawnTerm(cmd: string, args: string[], cwd: string, cols: number, rows:
   return id;
 }
 
-/** Interactive Opus planner in the repo, with the plan-format prompt and nothing else loaded. */
-function spawnPlanner(cols: number, rows: number): string {
+/** Interactive configured planner in the repo, with the shared plan-format prompt. */
+async function spawnPlanner(cols: number, rows: number): Promise<{ id: string; planner: ReturnType<typeof resolvePlanner> }> {
   if (!settings.repo) throw new Error("open a repository first");
-  const args = plannerArgs(DEFAULT_CONFIG);
+  const repo = settings.repo;
+  const { cmd, args, planner } = await plannerLaunch(config, repo);
+  if (settings.repo !== repo) throw new Error("repository changed while preparing the planning session; start it again");
   const i = args.indexOf("--mcp-config");
-  args[i + 1] = emptyMcpConfig(); // a file path survives cmd.exe quoting; inline JSON does not
-  return spawnTerm(DEFAULT_CONFIG.adapters.claude.cmd, args, settings.repo, cols, rows);
+  if (i >= 0) args[i + 1] = emptyMcpConfig(); // a file path survives cmd.exe quoting; inline JSON does not
+  return { id: spawnTerm(cmd, args, repo, cols, rows), planner };
 }
 
 /** Resume an agent's own session interactively in its lane; the engine holds the lane meanwhile. */
@@ -150,7 +162,7 @@ function spawnTakeover(file: string, agent: AgentId, cols: number, rows: number)
     r.release(agent);
     throw new Error(`${agent} has no session in this plan yet`);
   }
-  const cmd = DEFAULT_CONFIG.adapters[agent].cmd;
+  const cmd = config.adapters[agent].cmd;
   const args = agent === "claude"
     ? ["--resume", lane.sessionId, "--setting-sources", "project", "--strict-mcp-config", "--mcp-config", emptyMcpConfig()]
     : agent === "codex" ? ["resume", lane.sessionId] : ["-s", lane.sessionId];
@@ -204,10 +216,10 @@ handle("plan:setField", (file: string, taskId: string, key: EditableField, value
   writeFileSync(file, setTaskField(readFileSync(file, "utf8"), taskId, key, value?.trim() || undefined));
   return true;
 });
-handle("plan:resume", async (file: string, taskId: string, guidance: string | null, agent: AgentId | null, allowScope = false) => {
+handle("plan:resume", async (file: string, taskId: string, guidance: string | null, agent: AgentId | null, allowScope = false, model: string | null = null) => {
   const r = runnerFor(file);
   await r.prepare();
-  r.resumeTask(taskId, { ...(guidance ? { guidance } : {}), ...(agent ? { agent } : {}), allowScope });
+  r.resumeTask(taskId, { ...(guidance ? { guidance } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), allowScope });
   if (!r.running) void r.run();
   return true;
 });
@@ -237,6 +249,21 @@ handle("plan:taskDiff", async (file: string, taskId: string) => {
   return runnerFor(file).taskDiff(taskId);
 });
 handle("plan:authorDiff", (file: string, agent: string) => runnerFor(file).authorDiff(agent));
+handle("config:get", () => ({
+  path: userConfigPath(),
+  user: readUserConfig(),
+  effective: { planner: resolvePlanner(config), routing: config.routing, reviewers: config.reviewers, defaults: Object.fromEntries(Object.entries(config.adapters).map(([a, c]) => [a, c.defaultModel ?? {}])) },
+  builtin: { planner: resolvePlanner(DEFAULT_CONFIG), routing: DEFAULT_CONFIG.routing, reviewers: DEFAULT_CONFIG.reviewers, defaults: Object.fromEntries(Object.entries(DEFAULT_CONFIG.adapters).map(([a, c]) => [a, c.defaultModel ?? {}])) },
+  models: modelChoices(config),
+}));
+handle("config:save", (user: UserConfig) => {
+  const errors = validateUserConfig(user);
+  if (errors.length) throw new Error(errors.join("; "));
+  saveUserConfig(user);
+  reloadConfig();
+  return true;
+});
+handle("config:reset", () => { saveUserConfig({}); reloadConfig(); return true; });
 handle("log:open", (path: string) => shell.openPath(path));
 handle("pty:planner", (cols: number, rows: number) => spawnPlanner(cols, rows));
 handle("pty:takeover", (file: string, agent: AgentId, cols: number, rows: number) => spawnTakeover(file, agent, cols, rows));
@@ -287,6 +314,7 @@ if (process.env.HARNESS_SCREENSHOT) app.disableHardwareAcceleration();
 
 app.whenReady().then(() => {
   settings = loadSettings();
+  reloadConfig();
   watchPlans();
   createWindow();
 });

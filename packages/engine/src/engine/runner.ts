@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { DEFAULT_CONFIG, type AgentRef, type EngineConfig } from "../config.js";
+import { modelChoices } from "../agents/models.js";
 import { runTurn as defaultRunTurn, type AgentId, type TurnRequest, type TurnResult } from "../agents/turn.js";
 import { parseWorkerResult, renderBrief, renderFixPrompt, renderHandoff, RESULT_SCHEMA, type WorkerResult } from "../brief/brief.js";
 import { changedPaths, checksPassed, formatCheckFailures, hverifyCommand, runChecks as defaultRunChecks, scopeViolations, type CheckResult } from "../checks/checks.js";
@@ -132,7 +133,7 @@ export class PlanRunner extends EventEmitter {
   readonly repo: string;
   readonly planPath: string;
   readonly planRel: string;
-  readonly cfg: EngineConfig;
+  cfg: EngineConfig;
   readonly store: Store;
   private plan!: Plan;
   private readonly deps: RunnerDeps;
@@ -438,26 +439,31 @@ ${r.output}` });
     return withExtraScope(t, this.store.task(this.key, id));
   }
 
+  /** Swap the routing config; turns already running keep the one they started with. */
+  setConfig(cfg: EngineConfig): void {
+    this.cfg = cfg;
+    this.wakeUp();
+  }
+
+  /** What `agent` runs on when a task is pinned to it: the role's route, any route, a reviewer entry, then the agent's default. */
+  private refFor(agent: string, role: PlanTask["role"]): AgentRef {
+    const routed = [...this.cfg.routing[role], ...Object.values(this.cfg.routing).flat(), ...Object.values(this.cfg.reviewers).flat()]
+      .find((r) => r.agent === agent && r.model);
+    return routed ?? { agent, ...this.cfg.adapters[agent]?.defaultModel };
+  }
 
   /** Ordered agent choices for a task: reassignment, explicit override, then the role's routing. */
   candidates(t: PlanTask): AgentRef[] {
     const effort = t.effort ? { effort: t.effort } : {};
     const re = this.reassigned.get(t.id);
     if (re) return [{ ...re, ...effort }];
-    if (t.agent) {
-      const routed = [...this.cfg.routing[t.role], ...this.cfg.routing.implement, ...this.cfg.routing.hard].find((r) => r.agent === t.agent);
-      return [{ ...(routed ?? { agent: t.agent }), ...(t.model ? { model: t.model } : {}), ...effort }];
-    }
-
+    if (t.agent) return [{ ...this.refFor(t.agent, t.role), ...(t.model ? { model: t.model } : {}), ...effort }];
     return this.cfg.routing[t.role].map((r) => ({ ...r, ...effort }));
   }
 
-  /** Models the config knows per agent: the board's suggestions for a task's model. */
-  private modelChoices(): Record<string, string[]> {
-    const refs = [...Object.values(this.cfg.routing).flat(), ...Object.values(this.cfg.reviewers).flat()];
-    const out: Record<string, string[]> = {};
-    for (const r of refs) if (r.model && !(out[r.agent] ??= []).includes(r.model)) out[r.agent].push(r.model);
-    return out;
+  /** Models offered per agent in the pickers. */
+  modelChoices(): Record<string, string[]> {
+    return modelChoices(this.cfg);
   }
 
   private schedTasks(): SchedTask[] {
@@ -598,6 +604,11 @@ ${r.output}` });
 
   private async work(t: PlanTask, ref: AgentRef, ctl: AbortController): Promise<void> {
     const agent = ref.agent as AgentId;
+    // OpenCode cannot run without a provider/model: ask for one instead of spending a turn on the error.
+    if (agent === "opencode" && !ref.model) {
+      this.pause(t.id, "error", "OpenCode needs a provider/model: pick one in the Resume box, then resume");
+      return;
+    }
     this.setState(t.id, "dispatch", { agent, model: ref.model ?? null, note: null });
     this.mark(t.id, { done: false });
     const lane = await this.lane(agent);
@@ -972,7 +983,7 @@ ${r.output}` });
    * `allowScope` answers an out-of-scope request: the files join the task's write scope;
    * resuming without it declines them and the engine reverts them.
    */
-  resumeTask(taskId: string, opts: { guidance?: string; agent?: AgentId; allowScope?: boolean } = {}): void {
+  resumeTask(taskId: string, opts: { guidance?: string; agent?: AgentId; model?: string; allowScope?: boolean } = {}): void {
     const row = this.store.task(this.key, taskId);
     // A blocked agent asked a question; resending the same task without an answer just buys the same question again.
     if (row?.status === "waiting" && row.note?.startsWith("the agent is blocked") && !opts.guidance?.trim() && (!opts.agent || opts.agent === row.agent)) {
@@ -995,8 +1006,13 @@ ${r.output}` });
     const guidance = [scopeNote, opts.guidance?.trim()].filter(Boolean).join("\n");
     if (guidance) this.guidance.set(taskId, guidance);
     const current = row?.agent;
-    if (opts.agent && opts.agent !== current) this.reassign(t, opts.agent);
-    else this.resumed.add(taskId);
+    const model = opts.model?.trim();
+    if (opts.agent && opts.agent !== current) this.reassign(t, opts.agent, model);
+    else {
+      // Same agent, new model: keep its session, but run on the model you picked.
+      if (model) this.reassign(t, current ?? this.candidates(t)[0].agent, model);
+      this.resumed.add(taskId);
+    }
     // The orchestrator is not asked again: a human already looked, so a repeat failure comes straight back to you.
     this.setState(taskId, "resume", { attempts: 0, note: null }, { note: row.status === "interrupted" ? "continued after the app closed" : "resumed by you" });
     this.mark(taskId, { done: false });
@@ -1096,9 +1112,9 @@ ${r.output}` });
     this.wakeUp();
   }
 
-  private reassign(t: PlanTask, agent: string): void {
+  private reassign(t: PlanTask, agent: string, model?: string): void {
     this.reassigned.delete(t.id);
-    this.reassigned.set(t.id, this.candidates({ ...t, agent, model: undefined })[0]);
+    this.reassigned.set(t.id, this.candidates({ ...t, agent, model: model || undefined })[0]);
   }
 
   private mark(taskId: string, mark: TaskMark): void {

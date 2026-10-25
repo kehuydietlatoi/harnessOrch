@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import pc from "picocolors";
-import { DEFAULT_CONFIG, type EngineConfig } from "./config.js";
+import { loadConfig } from "./user-config.js";
 import { AGENT_IDS, type AgentId } from "./agents/turn.js";
 import { IN_FLIGHT, NEEDS_YOU } from "./engine/lifecycle.js";
 import { PlanRunner, type RunnerEvent } from "./engine/runner.js";
@@ -27,12 +27,6 @@ const USAGE = `ho — harnessOrch engine
 
 Options: --repo <dir> (default: current directory), --config <file.json>
   --allow-scope: keep the files the agent changed outside its write scope (they join the scope)`;
-
-function loadConfig(path?: string): EngineConfig {
-  if (!path) return DEFAULT_CONFIG;
-  const user = JSON.parse(readFileSync(path, "utf8")) as Partial<EngineConfig>;
-  return { ...DEFAULT_CONFIG, ...user, routing: { ...DEFAULT_CONFIG.routing, ...user.routing }, reviewers: { ...DEFAULT_CONFIG.reviewers, ...user.reviewers } };
-}
 
 function printEvent(e: RunnerEvent): void {
   const time = pc.dim(new Date().toLocaleTimeString());

@@ -6,7 +6,7 @@ How harnessOrch works today: the parts, how a plan runs, where state lives, and 
 
 ```mermaid
 flowchart LR
-  you([You]) -- plan with --> opus[Opus planner terminal]
+  you([You]) -- plan with --> opus[Claude / Codex planner terminal]
   opus -- writes --> planfile[".harness/plans/&lt;slug&gt;.md"]
   planfile -- parsed by --> runner
 

@@ -42,8 +42,8 @@ export function TaskPanel(props: {
         <button className="ghost icon" onClick={props.onClose} title="Close (Esc)">×</button>
       </header>
 
-      {NEEDS_YOU.includes(t.status) && <ResumeBox key={`${t.id}:${t.status}`} task={t}
-        onResume={(guidance, agent, allowScope) => call(api.call("plan:resume", props.planFile, t.id, guidance, agent, allowScope))}
+      {NEEDS_YOU.includes(t.status) && <ResumeBox key={`${t.id}:${t.status}`} task={t} choices={props.snap.modelChoices}
+        onResume={(guidance, agent, allowScope, model) => call(api.call("plan:resume", props.planFile, t.id, guidance, agent, allowScope, model))}
         onRestartClean={() => call(api.call("plan:restartClean", props.planFile, t.id))}
         onSkip={() => call(api.call("plan:skip", props.planFile, t.id))} />}
       {STOPPABLE.includes(t.status) && <StopBox key={t.id} task={t} planFile={props.planFile}
@@ -133,13 +133,16 @@ const NEEDS_YOU_TITLE: Record<string, string> = {
 
 function ResumeBox(props: {
   task: TaskView;
-  onResume: (guidance: string | null, agent: string | null, allowScope: boolean) => void;
+  choices: Record<string, string[]>;
+  onResume: (guidance: string | null, agent: string | null, allowScope: boolean, model: string | null) => void;
   onRestartClean: () => void;
   onSkip: () => void;
 }) {
   const [guidance, setGuidance] = useState("");
   const [agent, setAgent] = useState("");
+  const [model, setModel] = useState("");
   const t = props.task;
+  const runsOn = agent || t.assigned || "";
 
   // A blocked agent asked something: resuming without an answer would only buy the same question again.
   const asking = t.status === "waiting" && (t.note?.startsWith("the agent is blocked") ?? false);
@@ -160,14 +163,19 @@ function ResumeBox(props: {
         <button className="ghost small" title="Count this task as finished without changes so dependent tasks can run" onClick={props.onSkip}>Skip task</button>
         <button className="ghost small" title="Drop its parked edits and start over from a fresh brief" onClick={props.onRestartClean}>Restart clean</button>
         <div className="spacer" />
-        <select value={agent} onChange={(e) => setAgent(e.target.value)} title="Run it on">
+        <select value={agent} onChange={(e) => { setAgent(e.target.value); setModel(""); }} title="Run it on">
           <option value="">same agent (keeps its work)</option>
           {AGENTS.filter((a) => a !== t.assigned).map((a) => <option key={a} value={a}>{a} (starts fresh)</option>)}
         </select>
+        {runsOn && <>
+          <input className="model-input" list={`resume-models-${t.id}`} value={model} onChange={(e) => setModel(e.target.value)}
+            placeholder={agent && agent !== t.assigned ? `${agent} default model` : `${t.routedModel ?? "default"} model`} title="Model to run it on" />
+          <datalist id={`resume-models-${t.id}`}>{(props.choices[runsOn] ?? []).map((m) => <option key={m} value={m} />)}</datalist>
+        </>}
         {scope.length > 0 && <button className="primary" title="Add these files to the task's write scope, restore its edits and continue"
-          onClick={() => props.onResume(guidance || null, agent || null, true)}>Allow files and resume</button>}
+          onClick={() => props.onResume(guidance || null, agent || null, true, model.trim() || null)}>Allow files and resume</button>}
         <button className={scope.length ? "" : "primary"} disabled={!canResume} title={scope.length ? "Revert these files and continue inside the write scope" : canResume ? "Restore its edits and continue in the same session" : "Answer the agent's question first"}
-          onClick={() => props.onResume(guidance || null, agent || null, false)}>{scope.length ? "Resume without them" : "Resume"}</button>
+          onClick={() => props.onResume(guidance || null, agent || null, false, model.trim() || null)}>{scope.length ? "Resume without them" : "Resume"}</button>
       </div>
     </div>
   );

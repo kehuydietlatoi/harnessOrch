@@ -2,12 +2,13 @@ import { useCallback, useEffect, useState } from "react";
 import { api, STOPPABLE, type EventView, type PlanListItem, type RunnerEvent, type Snapshot } from "./api";
 import { Board } from "./Board";
 import { Drawer, useTerminals } from "./Drawer";
+import { Settings } from "./Settings";
 import { banner, formatLine } from "./format";
 import { StatusStrip } from "./StatusStrip";
 import { ReviewPanel } from "./ReviewPanel";
 import { TaskPanel } from "./TaskPanel";
 
-/** Dev/screenshot hook: `#task=T1&tab=activity` preselects a task and drawer tab. */
+/** Dev/screenshot hook: `#task=T1&tab=activity&settings=1` preselects a task, drawer tab and the settings dialog. */
 const initialHash = new URLSearchParams(window.location.hash.slice(1));
 
 export function App() {
@@ -19,6 +20,7 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(initialHash.get("task"));
   const [confirmStop, setConfirmStop] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [showSettings, setShowSettings] = useState(initialHash.has("settings"));
   const term = useTerminals(setError);
 
   useEffect(() => { const tab = initialHash.get("tab"); if (tab) term.setActive(tab); }, [term.setActive]);
@@ -98,6 +100,7 @@ export function App() {
         </select>
         <span className={`status-pill ${status}`}>{status}</span>
         <div className="spacer" />
+        <button className="ghost icon" title="Routing & models" onClick={() => setShowSettings(true)}>⚙</button>
         {planFile && <button className="ghost" onClick={() => void api.call("plan:open", planFile)}>Plan file</button>}
         {snap && !snap.running && !["ready", "merged", "discarded"].includes(status) &&
           <button className="primary" disabled={!!snap.errors.length} onClick={() => void guard(api.call("plan:start", planFile))}>▶ Start</button>}
@@ -148,7 +151,7 @@ export function App() {
         ) : (
           <div className="empty">
             {repo
-              ? <><p>No plan yet.</p><p className="muted">Open <b>Planner · Opus</b> below and plan with Opus; the plan appears here when it writes <code>.harness/plans/*.md</code>.</p></>
+              ? <><p>No plan yet.</p><p className="muted">Open the <b>Planner</b> tab below and plan with Claude or Codex; the plan appears here when it writes <code>.harness/plans/*.md</code>.</p></>
               : <><p>Open a git repository to start.</p><button className="primary" onClick={async () => { const r = await guard(api.call<string | null>("repo:choose")); if (r !== undefined) setRepo(r); }}>Open repository…</button></>}
           </div>
         )}
@@ -159,7 +162,8 @@ export function App() {
             onReview={async (action, allowScope) => { if (await guard(api.call("plan:review", planFile, reviewAgent, action, allowScope)) !== undefined) { setSelected(null); void refreshSnap(); } }} />}
       </main>
 
-      <Drawer term={term} snap={snap} events={events} repo={repo} planFile={planFile} blockedReviews={blockedReviews.length} />
+      {showSettings && <Settings onClose={() => setShowSettings(false)} onSaved={() => { void refreshSnap(); void term.refreshPlanner(); }} />}
+      <Drawer term={term} snap={snap} events={events} repo={repo} planFile={planFile} blockedReviews={blockedReviews.length} onPlannerSettings={() => setShowSettings(true)} />
     </div>
   );
 }

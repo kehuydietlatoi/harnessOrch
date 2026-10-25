@@ -1,6 +1,6 @@
 # harnessOrch
 
-A personal agent-team app for Windows. You plan with Claude Opus. A deterministic engine then runs the plan's tasks across Claude Code, Codex and OpenCode in parallel, checks the work itself, merges it, and pulls you in only when something needs a decision.
+A personal agent-team app for Windows. You plan with Claude Opus or Codex. A deterministic engine then runs the plan's tasks across Claude Code, Codex and OpenCode in parallel, checks the work itself, merges it, and pulls you in only when something needs a decision.
 
 The design comes from measuring the old `harness_orchestrator`, which averaged about 2.65M tokens per issue. The waste was inside the workers (inherited global config, whole-file reads, full test logs replayed every turn), not in spawning them. See [docs/research/](docs/research/) and the [M0 measurements](docs/m0-spikes.md).
 
@@ -8,7 +8,7 @@ The design comes from measuring the old `harness_orchestrator`, which averaged a
 
 For how the engine works inside (the loop, the task state machine, where state lives), see [docs/architecture.md](docs/architecture.md).
 
-1. **Plan.** Opus writes `.harness/plans/<slug>.md` in your repo: a YAML header plus `- [ ] **T1 — Title**` tasks, each with a YAML block (`role`, optional `agent`, `model` and `effort`, `goal`, `done_when`, `checks`, `write_scope`, `read_first`, `depends_on`, `skills`).
+1. **Plan.** Your planner writes `.harness/plans/<slug>.md` in your repo: a YAML header plus `- [ ] **T1 — Title**` tasks, each with a YAML block (`role`, optional `agent`, `model` and `effort`, `goal`, `done_when`, `checks`, `write_scope`, `read_first`, `depends_on`, `skills`).
 2. **Run.** The engine schedules tasks by dependency, with at most 3 agents at once.
    - Each agent works through its tasks in **one ongoing session** (cache-warm), in its own git worktree.
    - Tasks with overlapping write scopes never run at the same time.
@@ -65,7 +65,10 @@ From the CLI: `ho resume <plan.md> <task> --allow-scope`, or `ho review <plan.md
 | orchestrator | Codex → Claude Opus |
 | reviewer of Codex / Claude / OpenCode work | Claude Sonnet / Codex / Codex → Sonnet |
 
-To change any of this, pass a JSON file with `--config`; it overrides [packages/engine/src/config.ts](packages/engine/src/config.ts).
+To change any of this, use the ⚙ **Routing & models** dialog in the desktop app. It edits routing per role, reviewers, and the default model of each agent (what a task pinned to an agent runs on when no route names it), and saves to `~/.harnessorch/config.json`. `ho` reads the same file; `--config <file.json>` reads another one instead. Built-in values live in [packages/engine/src/config.ts](packages/engine/src/config.ts).
+
+The Codex model pickers include GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, and GPT-5.6 Sol, Terra and Luna, following the [current OpenAI model lineup](https://learn.chatgpt.com/docs/models). Custom model ids can also be entered in the pickers or saved under **Extra model ids**. Availability depends on your Codex account.
+
 
 ## Desktop app
 
@@ -75,8 +78,8 @@ npm run desktop        # builds the engine, then starts the Electron app (dev mo
 ```
 
 1. **Open repository…** to pick a git repo.
-2. **Start planning session** opens an interactive Opus terminal. It has the plan-format prompt and none of your global plugins or MCP servers. On a folder it hasn't seen before, Claude Code first asks you to trust it.
-3. When Opus writes `.harness/plans/<slug>.md`, the plan appears on the board. Change any task's agent from its dropdown (this edits the plan file), then press **Start**.
+2. In **Routing & models → Planner**, choose Claude Code (Opus by default) or Codex, then its model and thinking effort. **Start planning session** opens that planner's interactive terminal with the shared plan-format prompt. The planner choice is saved independently of task routing and applies to the next planning session. On a folder it hasn't seen before, the CLI may first ask you to trust it.
+3. When the planner writes `.harness/plans/<slug>.md`, the plan appears on the board. Change any task's agent from its dropdown (this edits the plan file), then press **Start**.
 4. Each agent tab shows that agent's live headless stream. Use **Take over** to resume that agent's own session in a real terminal while the engine holds its lane, and **Hand back** to return it.
 5. Paused tasks land in **Needs you**, with a guidance box and an agent picker; you also get a Windows notification. A task that needs files outside its write scope also gets an **Allow files** button (see [Write scope](#write-scope)). When every task is done and reviewed, **Merge to main** appears.
 
@@ -124,7 +127,7 @@ packages/engine   pure Node/TypeScript engine (no Electron), Vitest
   src/orchestrator decision and conflict prompts
   src/store       node:sqlite state and token ledger
   src/util, src/adapters, src/git, src/ledger   proven modules copied from harness_orchestrator
-  src/planner     the Opus planning session's prompt and lean flags
+  src/planner     the Claude/Codex planning session's prompt and lean flags
   src/skills      skill library listing and per-brief selection
 apps/desktop      Electron 45 + React + xterm + node-pty: board, planner terminal, agent streams
 skills/           vendored, pinned skill library (see skills/README.md)

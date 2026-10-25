@@ -26,7 +26,16 @@ export interface AdapterConfig {
   pricingMode?: "api" | "subscription" | "quota";
   models?: Record<EffortTier, ModelSpec>;
   leadModel?: ModelSpec;
+  /** What a task pinned to this agent runs on when nothing routes it there (OpenCode cannot run without one). */
+  defaultModel?: ModelSpec;
 }
+
+/** Models offered in pickers besides the configured ones. Any id can still be typed in. */
+export const KNOWN_MODELS: Record<string, string[]> = {
+  claude: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5-20251001", "opus", "sonnet", "haiku"],
+  codex: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+  opencode: ["opencode/deepseek-v4.1-flash-free", "opencode/glm-5.3-flash-free"],
+};
 
 /** One agent+model choice. Routing lists are ordered: the first available entry wins,
  * later entries are the usage-limit fallbacks. */
@@ -41,6 +50,8 @@ export type Role = typeof ROLES[number];
 
 export interface EngineConfig {
   adapters: Record<string, AdapterConfig>;
+  /** Interactive planning session, independent of task routing. Supports Claude and Codex. */
+  planner: AgentRef;
   /** Role → ordered agent choices (first available wins; the rest are fallbacks). */
   routing: Record<Role, AgentRef[]>;
   /** Author agent → ordered reviewer choices; a reviewer is never the author's own session. */
@@ -65,6 +76,8 @@ export interface EngineConfig {
   disposableIgnored: string[];
   /** Ignored dependency folders linked from the main checkout into every worktree (agents may not install packages). */
   sharedDirs: string[];
+  /** Extra model ids per agent for the pickers (e.g. a new Codex model), beyond KNOWN_MODELS. */
+  extraModels?: Record<string, string[]>;
 }
 
 /** Regenerable output that never makes a task worktree worth preserving. */
@@ -82,10 +95,11 @@ const FREE_GLM: AgentRef = { agent: "opencode", model: "opencode/glm-5.3-flash-f
  * implementation, and free OpenCode models take small well-defined tasks.
  */
 export const DEFAULT_CONFIG: EngineConfig = {
+  planner: OPUS,
   adapters: {
-    claude: { cmd: "claude", family: "anthropic", pricingMode: "subscription" },
-    codex: { cmd: "codex", family: "openai", pricingMode: "subscription" },
-    opencode: { cmd: "opencode", pricingMode: "quota" },
+    claude: { cmd: "claude", family: "anthropic", pricingMode: "subscription", defaultModel: { model: SONNET.model, effort: SONNET.effort } },
+    codex: { cmd: "codex", family: "openai", pricingMode: "subscription", defaultModel: { model: CODEX.model, effort: CODEX.effort } },
+    opencode: { cmd: "opencode", pricingMode: "quota", defaultModel: { model: FREE_DEEPSEEK.model, family: FREE_DEEPSEEK.family } },
   },
   routing: {
     implement: [CODEX],

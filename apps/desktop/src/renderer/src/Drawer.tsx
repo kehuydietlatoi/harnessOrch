@@ -4,7 +4,9 @@ import { AGENTS, api, NEEDS_YOU, prefs, type Agent, type EventView, type Snapsho
 import { Term, type TermHandle } from "./Term";
 
 export type TabKind = "activity" | "planner" | "stream" | "takeover";
-export interface DrawerTab { key: string; label: string; kind: TabKind; agent?: Agent; ptyId?: string; exited?: boolean }
+export interface DrawerTab { key: string; label: string; kind: TabKind; agent?: Agent; model?: string; ptyId?: string; exited?: boolean }
+interface Planner { agent: "claude" | "codex"; model?: string; effort?: string }
+const plannerLabel = (planner: Planner): string => `Planner · ${planner.agent === "codex" ? "Codex" : "Claude"}`;
 
 const MIN_HEIGHT = 120;
 const COLLAPSED = 34;
@@ -13,7 +15,7 @@ const COLLAPSED = 34;
 export function useTerminals(onError: (e: string) => void) {
   const [tabs, setTabs] = useState<DrawerTab[]>([
     { key: "activity", label: "Activity", kind: "activity" },
-    { key: "planner", label: "Planner · Opus", kind: "planner" },
+    { key: "planner", label: "Planner", kind: "planner" },
     ...AGENTS.map((a) => ({ key: `stream:${a}`, label: a, kind: "stream" as const, agent: a })),
   ]);
   const [active, setActive] = useState(() => prefs.get("drawerTab", "planner"));
@@ -21,6 +23,18 @@ export function useTerminals(onError: (e: string) => void) {
   const pending = useRef(new Map<string, string[]>());
   const ptyToTab = useRef(new Map<string, string>());
   const plannerLive = useRef(false);
+  const [planner, setPlanner] = useState<Planner | null>(null);
+  const [startingPlanner, setStartingPlanner] = useState(false);
+
+  const refreshPlanner = useCallback(async () => {
+    try {
+      const view = await api.call<{ effective: { planner: Planner } }>("config:get");
+      setPlanner(view.effective.planner);
+      setTabs((ts) => ts.map((t) => t.kind === "planner" && !t.ptyId ? { ...t, label: plannerLabel(view.effective.planner) } : t));
+    } catch (e) { onError((e as Error).message); }
+  }, [onError]);
+
+  useEffect(() => { void refreshPlanner(); }, [refreshPlanner]);
 
   useEffect(() => { prefs.set("drawerTab", active); }, [active]);
 
@@ -46,12 +60,12 @@ export function useTerminals(onError: (e: string) => void) {
       const { id } = p as { id: string };
       const key = ptyToTab.current.get(id);
       if (!key) return;
-      if (key === "planner") plannerLive.current = false;
+      if (key === "planner") { plannerLive.current = false; void refreshPlanner(); }
       write(key, "\r\n\x1b[2m[session ended]\x1b[0m\r\n");
       setTabs((ts) => ts.map((t) => (t.key === key ? { ...t, exited: true, ptyId: undefined } : t)));
     });
     return () => { offData(); offExit(); };
-  }, [write]);
+  }, [write, refreshPlanner]);
 
   const size = (key: string): [number, number] => {
     const h = handles.current.get(key);
@@ -59,14 +73,17 @@ export function useTerminals(onError: (e: string) => void) {
   };
 
   const startPlanner = useCallback(async () => {
+    if (plannerLive.current) return;
+    plannerLive.current = true;
+    setStartingPlanner(true);
     try {
-      const id = await api.call<string>("pty:planner", ...size("planner"));
+      const { id, planner: launched } = await api.call<{ id: string; planner: Planner }>("pty:planner", ...size("planner"));
       ptyToTab.current.set(id, "planner");
-      plannerLive.current = true;
-      setTabs((ts) => ts.map((t) => (t.key === "planner" ? { ...t, ptyId: id, exited: false } : t)));
+      setTabs((ts) => ts.map((t) => (t.key === "planner" ? { ...t, label: plannerLabel(launched), model: launched.model, ptyId: id, exited: false } : t)));
       setActive("planner");
       handles.current.get("planner")?.term.focus();
-    } catch (e) { onError((e as Error).message); }
+    } catch (e) { plannerLive.current = false; onError((e as Error).message); }
+    finally { setStartingPlanner(false); }
   }, [onError]);
 
   const takeOver = useCallback(async (planFile: string, agent: Agent) => {
@@ -92,7 +109,7 @@ export function useTerminals(onError: (e: string) => void) {
     setActive((cur) => (cur === "planner" && !plannerLive.current ? `stream:${agent}` : cur));
   }, []);
 
-  return { tabs, active, setActive, write, onReady, startPlanner, takeOver, closeTab, followAgent };
+  return { tabs, active, setActive, write, onReady, startPlanner, startingPlanner, planner, refreshPlanner, takeOver, closeTab, followAgent };
 }
 
 export function Drawer(props: {
@@ -102,6 +119,7 @@ export function Drawer(props: {
   repo: string | null;
   planFile: string | null;
   blockedReviews: number;
+  onPlannerSettings: () => void;
 }) {
   const { term, snap } = props;
   const [height, setHeight] = useState(() => prefs.get("drawerHeight", 320));
@@ -143,8 +161,14 @@ export function Drawer(props: {
           );
         })}
         <div className="spacer" />
-        {activeTab.kind === "planner" && !activeTab.ptyId &&
-          <button className="primary small" disabled={!props.repo} onClick={() => void term.startPlanner()}>Start planning session</button>}
+        {activeTab.kind === "planner" && <>
+          <button className="ghost small" onClick={props.onPlannerSettings} title="Choose the agent, model and thinking effort for the next planning session">
+            {(activeTab.ptyId ? activeTab.model : term.planner?.model) ?? "Choose planner"}
+          </button>
+          {!activeTab.ptyId && <button className="primary small" disabled={!props.repo || term.startingPlanner} onClick={() => void term.startPlanner()}>
+            {term.startingPlanner ? "Starting…" : "Start planning session"}
+          </button>}
+        </>}
         {activeTab.kind === "stream" && props.planFile && activeTab.agent && snap?.status !== "merged" &&
           <button className="small" disabled={snap?.agents.find((a) => a.agent === activeTab.agent)?.state === "working"}
             title="Resume this agent's own session in a real terminal; the engine holds its lane until you hand it back"

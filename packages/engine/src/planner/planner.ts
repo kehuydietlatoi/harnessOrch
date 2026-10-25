@@ -1,14 +1,17 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, formatModelSpec, type EngineConfig } from "../config.js";
+import { DEFAULT_CONFIG, formatModelSpec, type AgentRef, type EngineConfig } from "../config.js";
+import { CODEX_DISABLED_FEATURES } from "../agents/turn.js";
 import { orchHome } from "../ledger/telemetry.js";
 import { listSkills, type Skill } from "../skills/skills.js";
+import { exec } from "../util/exec.js";
+import { validateUserConfig } from "../user-config.js";
 
 export const PLANNER_PROMPT_PATH = join(orchHome(), "planner-prompt.md");
 
 /**
- * What the interactive Opus planning session is told, on top of Claude Code's
- * own prompt. It must produce a plan file the engine can run as-is.
+ * Shared contract for an interactive planning session. It must produce a plan
+ * file the engine can run as-is.
  */
 export function renderPlannerPrompt(cfg: EngineConfig = DEFAULT_CONFIG, skills: readonly Skill[] = listSkills()): string {
   const projectSkills = skills.filter((s) => s.group.startsWith("project/"));
@@ -75,15 +78,66 @@ export function writePlannerPrompt(cfg: EngineConfig = DEFAULT_CONFIG): string {
   return PLANNER_PROMPT_PATH;
 }
 
-/**
- * Interactive Claude (the unmodified binary, your own login) for planning:
- * Opus, no user plugins/skills/MCP servers, plus the planner prompt.
- */
-export function plannerArgs(cfg: EngineConfig = DEFAULT_CONFIG, model = cfg.routing.hard.find((r) => r.agent === "claude")?.model ?? "claude-opus-5-5"): string[] {
-  return [
-    "--model", model,
-    "--setting-sources", "project",
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-    "--append-system-prompt-file", writePlannerPrompt(cfg),
-  ];
+/** The planner has its own model choice; changing a task route never changes it. */
+export function resolvePlanner(cfg: EngineConfig = DEFAULT_CONFIG): AgentRef {
+  const selected = cfg.planner ?? DEFAULT_CONFIG.planner;
+  const errors = validateUserConfig({ planner: selected });
+  if (errors.length) throw new Error(errors.join("; "));
+  const adapter = cfg.adapters[selected.agent];
+  if (!adapter) throw new Error(`planner: no adapter configured for ${selected.agent}`);
+  const planner = { ...adapter.defaultModel, ...selected };
+  if (!planner.model?.trim()) throw new Error("planner: choose a model or configure the agent's default model");
+  return planner;
+}
+
+/** Interactive argv only. A string preserves the legacy Claude model override. */
+export function plannerArgs(cfg: EngineConfig = DEFAULT_CONFIG, selection?: AgentRef | string): string[] {
+  const planner = resolvePlanner(selection === undefined ? cfg : {
+    ...cfg, planner: typeof selection === "string" ? { agent: "claude", model: selection } : selection,
+  });
+  const prompt = writePlannerPrompt(cfg);
+  if (planner.agent === "claude") {
+    return [
+      "--model", planner.model!,
+      ...(planner.effort ? ["--effort", planner.effort] : []),
+      "--setting-sources", "project",
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+      "--append-system-prompt-file", prompt,
+    ];
+  }
+  // The TUI has no --ignore-user-config flag. Disable unused features and the
+  // automatic skills catalog while preserving the user's own login and base prompt.
+  const args = ["--no-daemon", "-m", planner.model!];
+  if (planner.effort) args.push("-c", `model_reasoning_effort=${planner.effort}`);
+  for (const feature of [...CODEX_DISABLED_FEATURES, "hooks", "memories"]) args.push("--disable", feature);
+  args.push("-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false");
+  args.push(`Read and follow the planning contract in ${prompt.replace(/\\/g, "/")} before planning. Then ask the user what they want to plan.`);
+  return args;
+}
+
+/** Prepare an interactive launch without starting a model or any MCP server. */
+export async function plannerLaunch(cfg: EngineConfig = DEFAULT_CONFIG, cwd = process.cwd()): Promise<{
+  cmd: string; args: string[]; planner: AgentRef;
+}> {
+  const planner = resolvePlanner(cfg);
+  const cmd = cfg.adapters[planner.agent].cmd;
+  const args = plannerArgs(cfg, planner);
+  if (planner.agent === "codex") {
+    // Config tables merge, so `-c mcp_servers={}` leaves user servers enabled.
+    // Enumerate names locally and explicitly disable each one for this session.
+    // Apply the same feature settings to discovery: disabled plugins may remove
+    // their servers, and overriding a removed server would create an invalid stub.
+    const result = await exec(cmd, [...args.slice(0, -1), "mcp", "list", "--json"], { cwd, timeoutMs: 10_000, maxBuffer: 1_048_576 });
+    if (result.code !== 0) throw new Error("Could not inspect Codex MCP settings; planning session was not started");
+    let servers: unknown;
+    try { servers = JSON.parse(result.stdout); } catch { /* report only the contract failure, never server credentials */ }
+    if (!Array.isArray(servers) || servers.some((s: unknown) => !s || typeof s !== "object" ||
+      typeof (s as { name?: unknown }).name !== "string" || !/^[a-zA-Z0-9_-]+$/.test((s as { name: string }).name))) {
+      throw new Error("Could not read Codex MCP server names; planning session was not started");
+    }
+    const overrides = [...new Set(servers.map((s: { name: string }) => s.name))]
+      .flatMap((name) => ["-c", `mcp_servers.${name}.enabled=false`]);
+    args.unshift(...overrides);
+  }
+  return { cmd, args, planner };
 }
