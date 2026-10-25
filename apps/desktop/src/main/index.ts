@@ -10,6 +10,8 @@ import {
 } from "@harnessorch/engine";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
+// A packaged app carries the skills library beside its resources, not next to the engine package.
+if (app.isPackaged) process.env.HARNESS_SKILLS_ROOT = join(process.resourcesPath, "skills");
 const settingsFile = (): string => join(app.getPath("userData"), "settings.json");
 
 interface Settings { repo?: string }

@@ -5,3 +5,4 @@ coverage/
 logs/
 *.log
 .harness-state/
+release/

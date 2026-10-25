@@ -1,0 +1,16 @@
+appId: dev.harnessorch.app
+productName: harnessOrch
+directories:
+  output: ../../release
+files:
+  - out/**
+  - package.json
+# The engine hands agents real file paths (assets/, skills/): they must be plain files, not inside an asar.
+asar: false
+# node-pty's prebuilt binary is copied as is; no C++ toolchain needed.
+npmRebuild: false
+extraResources:
+  - from: ../../skills
+    to: skills
+win:
+  target: dir

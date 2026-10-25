@@ -12,7 +12,8 @@
     "lint": "eslint .",
     "build": "npm run build -w packages/engine && npm run build -w apps/desktop",
     "desktop": "npm run build -w packages/engine && npm run dev -w apps/desktop",
-    "ho": "npm run ho -w packages/engine --"
+    "ho": "npm run ho -w packages/engine --",
+    "app": "node scripts/build-app.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

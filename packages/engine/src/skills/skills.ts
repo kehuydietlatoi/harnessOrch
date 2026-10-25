@@ -24,8 +24,9 @@ const dirs = (p: string): string[] => {
   try { return readdirSync(p).filter((n) => statSync(join(p, n)).isDirectory()); } catch { return []; }
 };
 
-/** Every SKILL.md in the library. Missing library → empty (skills are optional). */
-export function listSkills(root = DEFAULT_SKILLS_ROOT): Skill[] {
+/** Every SKILL.md in the library. Missing library → empty (skills are optional).
+ * HARNESS_SKILLS_ROOT moves the library: a packaged app keeps it outside the engine package. */
+export function listSkills(root = process.env.HARNESS_SKILLS_ROOT || DEFAULT_SKILLS_ROOT): Skill[] {
   const out: Skill[] = [];
   for (const kind of ["core", "project"]) {
     for (const group of dirs(join(root, kind))) {

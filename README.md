@@ -76,6 +76,7 @@ The desktop app also has a **Graph** view beside the board: tasks by dependency,
 ```
 npm install
 npm run desktop        # builds the engine, then starts the Electron app (dev mode)
+npm run app            # builds release/win-unpacked/harnessOrch.exe (in Claude Code here: /build-app)
 ```
 
 1. **Open repository…** to pick a git repo.
